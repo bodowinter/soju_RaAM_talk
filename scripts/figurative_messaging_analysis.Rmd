@@ -1,0 +1,781 @@
+---
+title: "Soju Ads - Analysis of Figurative Messaging"
+author: "Bodo"
+date: "2024-12-12"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Intro
+
+This analysis looks at Paula & Lucien's annotated `dataset_2024.csv` file, which is a sample of all of our ads analyzed and annotated for figurative messaging.
+
+# Setup
+
+Load libraries and data:
+
+```{r warning = FALSE, message = FALSE}
+# Packages:
+
+library(tidyverse)   # for data processing and visualization
+library(brms)        # for Bayesian models
+
+# Data:
+
+ads <- read_csv('../data/figurative_annotation_dataset_2024.csv')
+```
+
+Get an impression of this data:
+
+```{r}
+# First 4 lines:
+
+ads |> print(n = 4, width = Inf)
+
+# Some random lines:
+
+ads |> sample_n(6)
+
+# Last couple lines:
+
+slice_tail(ads, n = 10)
+```
+
+Last couple rows need fixing.
+
+# Processing
+
+Get rid of the `NA` rows towards the end of the tibble.
+
+```{r}
+ads <- filter(ads, !is.na(item))
+
+# Sanity check:
+
+slice_tail(ads, n = 10)
+```
+
+Good.
+
+Extract time from add:
+
+```{r}
+ads$year <- as.numeric(str_split(ads$item, pattern = '_', simplify = TRUE)[, 2])
+```
+
+Create a `year_binned` variable that codes for decades:
+
+```{r}
+ads <- mutate(ads,
+              year_binned = case_when(year < 1970 ~ 1960,
+                                      year >= 1970 & year < 1980 ~ 1970,
+                                      year >= 1980 & year < 1990 ~ 1980,
+                                      year >= 1990 & year < 2000 ~ 1990,
+                                      year >= 2000 & year < 2010 ~ 2000,
+                                      year >= 2010 & year < 2020 ~ 2010,
+                                      year >= 2020 ~ 2020))
+```
+
+Break down the `Figuration` column and split the content of that into respective columns. First, what unique cases are we dealing with?
+
+```{r}
+ads |> 
+  distinct(Figuration)
+```
+
+There is an `NA`! Let's check this:
+
+```{r}
+filter(ads, is.na(Figuration))
+
+filter(ads, is.na(Figuration))$Label
+```
+
+OK, this should be metonymy, but I don't know whether it's in the text or the image or background, so let's ask Paula and Lucien to check id 308 again. For now, let's just code this as metonymy, and elsewhere `WATER FOR CLEANLINESS` is coded as `Metonymy_nature`, so we'll give it that label.
+
+```{r}
+ads <- mutate(ads,
+              Figuration = if_else(is.na(Figuration), 'Metonymy_nature', Figuration))
+```
+
+OK, now we can split the variable. The problem is that the respective variables (type of metaphor/metonymy: `other`, `nature`, `primary`, and modality: `text`, `background`) are not always in the same positions, so we shouldn't be using `str_split()` but probably just search for the strings instead. The first element we can always split, that's just the figurative device used and always at the first spot:
+
+```{r}
+ads$fig_device <- str_split(ads$Figuration, '_', simplify = TRUE)[, 1]
+```
+
+Then the other two variables:
+
+```{r}
+ads <- ads |> 
+  mutate(fig_type = case_when(str_detect(Figuration, 'other') ~ 'other',
+                              str_detect(Figuration, 'nature') ~ 'nature'),
+         modality = case_when(str_detect(Figuration, 'text') ~ 'text',
+                              str_detect(Figuration, 'background') ~ 'background'))
+```
+
+Check:
+
+```{r}
+ads |> 
+  sample_n(10) |> 
+  select(Figuration, fig_type, modality)
+```
+
+OK, so for modality, the `NA` are images since that's the one that wasn't flagged.
+
+```{r}
+ads <- mutate(ads, modality = if_else(is.na(modality), 'image', modality))
+```
+
+For some ads we have duplicates. Let's get rid of them:
+
+```{r}
+nrow(ads)
+
+ads <- ads |> 
+  distinct(id, item, Label, Figuration, Frame1, Frame2, year,
+           year_binned, fig_type, fig_device, modality)
+  
+
+nrow(ads)
+```
+
+This already takes care of what Paula warned me of, that some duplicates in the `label` column are OK if they are in a different modality.
+
+# Descriptive stats
+
+How many ads?
+
+```{r}
+ads |> distinct(id) |> nrow()
+```
+
+161
+
+Check how many rows there are per item. The rows are the number of figurative devices resulting from the annotation process, i.e. more rows = more figurative messaging.
+
+```{r}
+ads |> 
+  count(id) |> 
+  count(n) |> 
+  mutate(p = nn / sum(nn),
+         perc = round(p, 3) * 100,
+         perc = str_c(perc, '%'))
+```
+
+Looks like the first four (1 figurative device, 2 figurative devices, 3 ..., 4...) cover about two thirds of the data.
+
+```{r}
+0.18 + 0.168 + 0.18 + 0.174
+```
+
+70% of the data is 1-4 figurative devices. Which means 30% of the data is 5 or more devices.
+
+Make a plot of this:
+
+```{r}
+ads |> 
+  count(id) |> 
+  count(n) |> 
+  mutate(p = nn / sum(nn),
+         perc = round(p, 3) * 100,
+         perc = str_c(perc, '%')) |> 
+  ggplot(aes(x = n, y = p)) +
+  scale_x_continuous(breaks = 1:8) +
+  scale_y_continuous(limits = c(0, 0.25),
+                     breaks = seq(0, 0.25, 0.05),
+                     labels = str_c(seq(0, 25, 5), '%'),
+                     expand = c(0, 0)) +
+  xlab('Number of figurative devices') +
+  ylab('Proportion') +
+  geom_col(width = 0.7)
+
+ggsave('../figures/png/number_of_figurative_deviced.png',
+       width = 5.2, height = 3.8)
+```
+
+What is the average number of figurative devices?
+
+```{r}
+ads |> 
+  count(id) |> 
+  summarize(mean_figurative = mean(n),
+            median_figurative = median(n))
+```
+
+On average about 3.61 figurative devices per ad.
+
+Let's look at the same across time:
+
+```{r}
+ads |> 
+  count(id, year) |> 
+  group_by(year) |> 
+  summarize(mean_figurative = mean(n)) |> 
+  ggplot(aes(x = year, y = mean_figurative)) +
+  geom_line() +
+  theme_classic()
+```
+
+Nice... looks like a relatively clear upwards trend: more figurative devices as time goes on. Let's look at this using the more coarse decades variable (`year_binned`):
+
+```{r}
+ads |> 
+  count(id, year_binned) |> 
+  group_by(year_binned) |> 
+  summarize(mean_figurative = mean(n))
+```
+
+Check modality over time using decades:
+
+```{r}
+ads |> 
+  count(year_binned, modality) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, color = modality)) +
+  geom_line() +
+  theme_classic()
+
+ggsave('../figures/png/modality_over_time.png',
+       width = 4, height = 2.5)
+```
+
+Nice. Looks like there is a small trend towards more image figurative devices, and definitely a relative decline in text. We'll model that later!
+
+Let's look at the `fig_type` variable for other/nature:
+
+```{r}
+ads |> 
+  count(year_binned, fig_type) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, color = fig_type)) +
+  geom_line() +
+  theme_classic()
+
+ggsave('../figures/png/figurative_type_over_time.png',
+       width = 4, height = 2.5)
+```
+
+Definitely more nature metaphors over time.
+
+Let's look at metaphor vis-a-vis metonymy vis-a-vis personification, first across the entire dataset:
+
+```{r}
+ads |> 
+  count(fig_device) |> 
+  mutate(prop = n / sum(n),
+            perc = round(prop, 3) * 100)
+```
+
+Close to 60% metonymy, 20% metaphor and personification.
+
+Let's look at metaphor vis-a-vis metonymy vis-a-vis personification over time, using the coarse `year_binned` variable:
+
+```{r}
+ads |> 
+  count(year_binned, fig_device) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, color = fig_device)) +
+  geom_line() +
+  theme_classic()
+
+ggsave('../figures/png/figurative_device_over_time.png',
+       width = 4, height = 2.5)
+```
+
+Slightly more metonymy over time, less metaphor?
+
+# Models:
+
+Everything in the above are counts, so Poisson/Negative Binomial models seem like a good starting point. I'm using negbinomial here because it's the more conservative approach and then I don't have to worry checking for overdispersion (excess variance) as the negbinomial has a parameter to estimate that.
+
+We'll just use a simple `id` random effect to control for repeated measures per ad... for now, let's not worry about any company or brand random effects.
+
+For now, let's make models of:
+
+- number of figurative devices per ad over time
+- number of metaphors, metonymies, and personification across time
+- rise of nature metaphors over time
+- text versus image
+
+## N of figurative devices over time
+
+For now, just default priors (more thinking incoming).
+
+```{r eval = FALSE}
+# Setup data frame:
+
+fig_n_df <- ads |> count(year, id)
+
+# Check:
+
+fig_n_df
+
+# Set n - 1 since each ad has at least one device:
+
+fig_n_df <- mutate(fig_n_df, n = n - 1)
+
+# Model 'n' over 'year', each data point is one ad, so no random effect for 'id' needed:
+
+fig_n_mdl <- brm(n ~ 1 + year,
+                 data = fig_n_df,
+                 family = negbinomial,
+                 
+                 # MCMC settings:
+                 
+                 chains = 4, cores = 4,
+                 iter = 4000, warmup = 2000)
+
+# Save:
+
+save(fig_n_mdl, file = '../models/fig_n_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/fig_n_mdl.RData')
+```
+
+Show:
+
+```{r}
+fig_n_mdl
+```
+
+Looks like nice year effect:
+
+```{r}
+# hypothesis(fig_n_mdl, 'year > 0')
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+fig_n_df <- conditional_effects(fig_n_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+fig_n_p <- fig_n_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+fig_n_p <- fig_n_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(breaks = 0:5, labels = 0:5,
+                     limits = c(0, 5)) +
+  xlab('Year') +
+  ylab('Count of figurative devices')
+
+# Show and save:
+
+fig_n_p
+ggsave('../figures/pdf/figurative_device_number.pdf', fig_n_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/figurative_device_number.png', fig_n_p,
+       width = 5.8, height = 3.7)
+```
+
+Same thing but with smoothing term to compare:
+
+```{r eval = FALSE}
+# Model 'n' over 'year', each data point is one ad, so no random effect for 'id' needed:
+
+fig_n_gam <- brm(n ~ 1 + s(year),
+                 data = fig_n_df,
+                 family = negbinomial,
+                 
+                 # MCMC settings:
+                 
+                 chains = 4, cores = 4,
+                 iter = 7000, warmup = 5000,
+                 control = list(adapt_delta = 0.99))
+
+# Save:
+
+save(fig_n_gam, file = '../models/fig_n_gam.RData')
+```
+
+Load:
+
+```{r}
+load('../models/fig_n_gam.RData')
+```
+
+Show:
+
+```{r}
+fig_n_gam
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+fig_n_df <- conditional_effects(fig_n_gam)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+fig_n_p <- fig_n_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+fig_n_p <- fig_n_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(breaks = 0:5, labels = 0:5,
+                     limits = c(0, 5)) +
+  xlab('Year') +
+  ylab('Count of figurative devices')
+
+# Show and save:
+
+fig_n_p
+ggsave('../figures/pdf/figurative_device_number_gam.pdf', fig_n_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/figurative_device_number_gam.png', fig_n_p,
+       width = 5.8, height = 3.7)
+```
+
+
+
+## Metaphor/metonymy/personification over time
+
+```{r eval = FALSE}
+# Setup data frame:
+
+fig_device_df <- ads |>
+  count(year, id, fig_device) |> 
+  pivot_wider(values_from = n, names_from = fig_device, values_fill = 0) |>
+  pivot_longer(cols = Metaphor:Personification, names_to = 'fig_device', values_to = 'n')
+
+# Check:
+
+fig_device_df
+
+# Convert to factor with personification as reference level:
+
+fig_device_df <- mutate(fig_device_df,
+                        fig_device = factor(fig_device, levels = c('Personification',
+                                                                   'Metaphor', 'Metonymy')))
+
+# Model 'n' over 'year' and which device, now we have 3 data points per ad, so adding random effect:
+
+fig_dev_mdl <- brm(n ~ 1 + year + fig_device +
+                     year:fig_device +
+                     (1|id),
+                   data = fig_device_df,
+                   family = negbinomial,
+                 
+                   # MCMC settings:
+                 
+                   chains = 4, cores = 4,
+                   iter = 4000, warmup = 2000)
+
+# Save:
+
+save(fig_dev_mdl, file = '../models/fig_dev_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/fig_dev_mdl.RData')
+```
+
+Show:
+
+```{r}
+fig_dev_mdl
+```
+
+Looks like nice year effect for the reference category (personification):
+
+```{r}
+hypothesis(fig_dev_mdl, 'year > 0')
+hypothesis(fig_dev_mdl, 'year + year:fig_deviceMetaphor < 0')
+hypothesis(fig_dev_mdl, 'year + year:fig_deviceMetonymy > 0')
+```
+
+More metonymy and personification over time, less metaphor over time.
+
+## Nature over time
+
+See whether metonymies and metaphors related to nature have increased over time.
+
+This will be a logistic regression model as we're looking at the proportion of nature metaphors/metonymies out of the total number of figurative devices:
+
+```{r}
+ads |> 
+  count(fig_type)
+```
+
+Create a nature versus rest variable out of this:
+
+```{r}
+ads <- ads |> 
+  mutate(nature_v_rest = if_else(fig_type == 'nature', 'nature', 'other'),
+         nature_v_rest = if_else(is.na(nature_v_rest), 'other', nature_v_rest))
+```
+
+Let's look at the `fig_type` variable for other/nature:
+
+```{r eval = FALSE}
+# Factor code:
+
+ads <- ads |> 
+  mutate(nature_v_rest = factor(nature_v_rest, levels = c('other', 'nature')))
+
+# Proportion of nature metaphor/metonymy over time:
+
+nature_mdl <- brm(nature_v_rest ~ 1 + s(year),
+                   data = ads,
+                   family = bernoulli,
+                 
+                   # MCMC settings:
+                 
+                   chains = 4, cores = 4,
+                   iter = 7000, warmup = 5000,
+                  control = list(adapt_delta = 0.99))
+
+# Save:
+
+save(nature_mdl, file = '../models/nature_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/nature_mdl.RData')
+```
+
+Show:
+
+```{r}
+nature_mdl
+```
+
+Hypothesis tests:
+
+```{r}
+# hypothesis(nature_mdl, 'year > 0')
+```
+
+*Fairly* certain that the year effect is positive... 94% certain given this model, data, and priors.
+
+
+Extract conditional effects for plotting:
+
+```{r}
+fig_n_df <- conditional_effects(nature_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+fig_n_p <- fig_n_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+fig_n_p <- fig_n_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25), labels = seq(0, 1, 0.25),
+                     limits = c(0, 1)) +
+  xlab('Year') +
+  ylab('Proportion of nature metaphors/metonymies')
+
+# Show and save:
+
+fig_n_p
+ggsave('../figures/pdf/nature_over_time_gam.pdf', fig_n_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/nature_over_time_gam.png', fig_n_p,
+       width = 5.8, height = 3.7)
+```
+
+
+
+## Image versus text
+
+Image versus text and since that has a upper bound/total, let's do that in logistic regression:
+
+```{r eval = FALSE}
+# Setup data frame:
+
+modality_df <- ads |>
+  count(year, id, modality) |> 
+  pivot_wider(values_from = n, names_from = modality, values_fill = 0) |>
+  pivot_longer(cols = text:background, names_to = 'modality', values_to = 'n')
+
+# Add total:
+
+modality_df <- ads |> 
+  count(id) |> 
+  rename(total = n) |> 
+  right_join(modality_df)
+
+# Check:
+
+modality_df
+
+# Convert to factor with personification as reference level:
+
+modality_df <- mutate(modality_df,
+                      modality = factor(modality, levels = c('background',
+                                                             'text', 'image')))
+
+# Model 'n' over 'year' and which device, now we have 3 data points per ad, so adding random effect:
+
+modality_mdl <- brm(n | trials(total) ~ 1 + year + modality +
+                      year:modality +
+                     (1|id),
+                   data = modality_df,
+                   family = binomial,
+                 
+                   # MCMC settings:
+                 
+                   chains = 4, cores = 4,
+                   iter = 4000, warmup = 2000)
+
+# Save:
+
+save(modality_mdl, file = '../models/modality_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/modality_mdl.RData')
+```
+
+Show:
+
+```{r}
+modality_mdl
+```
+
+Ok, so an upwards slope of `year` for the reference level, which is background, and then that trend is reverted for text and slightly dampened for image.
+
+```{r}
+hypothesis(modality_mdl, 'year > 0') # background
+hypothesis(modality_mdl, 'year + year:modalitytext < 0') # text
+hypothesis(modality_mdl, 'year + year:modalityimage > 0') # image
+```
+
+Confident in positive trends for background and image over time, and negative trend for text over time.
+
+Model text versus image + background (= visual).
+
+```{r}
+ads <- ads |> 
+  mutate(modality_red = if_else(modality == 'text', 'text', 'visual'))
+```
+
+Make a model of this:
+
+```{r eval = FALSE}
+# Make into factor:
+
+ads <- ads |> 
+  mutate(modality_red = factor(modality_red,
+                               levels = c('text', 'visual')))
+
+# Model proportion over year:
+
+visual_mdl <- brm(modality_red ~ 1 + s(year) +
+                     (1|id),
+                   data = ads,
+                   family = bernoulli,
+                 
+                   # MCMC settings:
+                 
+                   chains = 4, cores = 4,
+                   iter = 6000, warmup = 3000,
+                   control = list(adapt_delta = 0.98))
+
+# Save:
+
+save(visual_mdl, file = '../models/visual_mdl.RData')
+```
+
+Load model:
+
+```{r}
+load('../models/visual_mdl.RData')
+```
+
+
+Extract conditional effects for plotting:
+
+```{r}
+fig_n_df <- conditional_effects(visual_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+fig_n_p <- fig_n_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+fig_n_p <- fig_n_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25), labels = seq(0, 1, 0.25),
+                     limits = c(0, 1)) +
+  xlab('Year') +
+  ylab('Proportion of visual vs text') +
+  theme_classic() +
+  theme(axis.title.x = element_text(face = 'bold'),
+        axis.title.y = element_text(face = 'bold'))
+
+# Show and save:
+
+fig_n_p
+ggsave('../figures/pdf/visual_v_text.pdf', fig_n_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/visual_v_text.png', fig_n_p,
+       width = 5.8, height = 3.7)
+```
+
+This completes this analysis.
+
+
+
+

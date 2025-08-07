@@ -1,0 +1,6012 @@
+---
+title: "Soju ad analysis"
+author: "Bodo"
+date: "2023-08-01"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Throughout the script, I use `'grey'` for ribbons, and `purple` for lines.
+
+# Setup
+
+## Data and packages
+
+Libraries:
+
+```{r message = FALSE, warning = FALSE}
+# Core:
+
+library(tidyverse)
+library(brms)
+
+# Multi-feature analyses:
+
+library(FactoMineR)   # for MCA
+library(factoextra)   # for MCA
+library(ranger)       # for random forests
+
+# Helper:
+
+library(bayesplot)    # for MCMC diagnostic plots
+library(patchwork)    # for multi plots
+```
+
+Load in data:
+
+```{r message = FALSE, warning = FALSE}
+soju <- read_csv('../data/soju_combined_2023_12_13.csv') # New file, added July 8, 2025 while in Eugene
+```
+
+Show all column names:
+
+```{r}
+colnames(soju)
+```
+
+## Define themes, helper functions, and colors:
+
+Set theme for all ggplots in this session:
+
+```{r}
+theme_set(theme_classic() +
+            theme(axis.title = element_text(face = 'bold'),
+                axis.title.y = element_text(margin = margin(r = 11))))
+```
+
+Create a function, which I'll call `adorn_percentages()` in analogy with the `janitor` package, that first uses `count()` given some column specifications (`...`), and then appends a column of percentages.
+
+```{r}
+adorn_percentages <- function(x, ...) {
+  df <- count(x, ..., sort = TRUE) |> 
+    mutate(prop = n / sum(n),
+           prop = round(prop, 2),
+           prop = prop * 100,
+           p = str_c(prop, '%')) |> 
+    select(-prop)
+  
+  return(df)
+}
+```
+
+# Data cleaning
+
+## Minor stuff
+
+Change the name of the `year-binned` variable:
+
+```{r}
+soju <- rename(soju,
+               year_binned = `year-binned`)
+```
+
+Fix typo of the 'Califonia (USA)' in `production_area`, and of `LotTe 롯데` in `company`:
+
+```{r}
+soju <- mutate(soju,
+               production_area = if_else(production_area == 'Califonia (USA)',
+                                         'California (USA)',
+                                         production_area),
+               company = if_else(company == 'LotTe 롯데',
+                                 'Lotte 롯데',
+                                 company))
+```
+
+## Collapse medium
+
+Make the one `Banner` ad into `Magazine`. It's actually part of a series of ads and the surrounding ones were classified as `Magazine`. Our research assistant seems to have chosen `Banner` because of the wide format, but it's clearly printed in the same medium as the others.
+
+```{r}
+soju <- mutate(soju,
+               medium = if_else(medium == 'Banner', 'Magazine', medium))
+```
+
+## Collapse company location
+
+We have a lot of different production areas / locations for companies and want to reduce those categories to a smaller, more manageable and more easily reportable set:
+
+```{r}
+unique(soju$production_area)
+```
+
+Let's reassign:
+
+```{r}
+soju <- soju |> 
+  mutate(production_area_red = if_else(str_detect(production_area, 'Gyeongsang'),
+                                       'Busan + Daegu + Gyeongsang', production_area),
+         production_area_red = if_else(str_detect(production_area_red, 'Jeolla'),
+                                       'Kwangju + Jeolla', production_area_red),
+         production_area_red = if_else(str_detect(production_area_red, 'Gyeonggi'),
+                                       'Seoul + Gyeonggi', production_area_red),
+         production_area_red = if_else(str_detect(production_area_red, 'Chungcheong'),
+                                       'Daejon + Chungcheong', production_area_red),)
+```
+
+Check:
+
+```{r}
+unique(soju$production_area_red)
+```
+
+We still need to integrate the main cities:
+
+```{r}
+soju <- soju |> 
+  mutate(production_area_red = if_else(production_area_red == 'Busan Metropolitan City',
+                                       'Busan + Daegu + Gyeongsang', production_area_red),
+         production_area_red = if_else(production_area_red == 'Daegu Metropolitan City',
+                                       'Busan + Daegu + Gyeongsang', production_area_red),
+         production_area_red = if_else(production_area_red == 'Daejeon Metropolitan City',
+                                       'Daejon + Chungcheong', production_area_red),
+         production_area_red = if_else(production_area_red == 'Seoul Metropolitan City',
+                                       'Seoul + Gyeonggi', production_area_red),
+         production_area_red = if_else(production_area_red == 'Kwangju Metropolitan City',
+                                       'Kwangju + Jeolla', production_area_red))
+```
+
+Check again:
+
+```{r}
+unique(soju$production_area_red)
+```
+
+
+## Main slogan and secondary slogan
+
+Check some random `main_slogan` and `secondary_slogan` tables.
+
+```{r}
+soju |> 
+  sample_n(10) |> 
+  select(year, main_slogan)
+
+soju |>  
+  sample_n(10) |> 
+  select(year, secondary_slogan)
+```
+
+We should split the Korean and English into separate columns as this violates tidy data principles (two different values in the same column). Also because we will do some text analyses later.
+
+One row has `En:` instead of `EN:` for `main_slogan`. This will have to be fixed:
+
+```{r}
+soju <- mutate(soju,
+               main_slogan = if_else(id == 279,
+                                     str_replace(main_slogan, 'En', 'EN'),
+                                     main_slogan))
+
+# Check:
+
+filter(soju, id %in% 278:280) |> pull(main_slogan)
+```
+
+There are cases that don't have `EN:` in them. These are the ones that only have English text. We'll deal with this by duplicating the English text as an English translation.
+
+```{r}
+# Extract IDs that are missing EN:
+
+ids <- filter(soju,
+              !str_detect(main_slogan, 'EN: ')) |> pull(id)
+
+# Duplicate them:
+
+soju <- mutate(soju,
+               main_slogan = if_else(id %in% ids,
+                                     str_c(main_slogan, ' EN: ', main_slogan),
+                                     main_slogan))
+
+# Check:
+
+filter(soju, id %in% ids) |> 
+  pull(main_slogan)
+```
+
+Now we can separate the two columns into Korean and English:
+
+```{r}
+soju <- soju |> 
+  separate(main_slogan, sep = 'EN: ',
+           into = c('main_slogan_korean', 'main_slogan_english'))
+```
+
+Let's move on to the secondary slogan. Data point `id == 135` is missing a space.
+
+```{r}
+soju <- mutate(soju,
+               secondary_slogan = if_else(id == 135,
+                                          str_replace(secondary_slogan, 'EN:', 'EN: '),
+                                          secondary_slogan))
+
+# Check:
+
+filter(soju, id == 135) |> pull(secondary_slogan)
+```
+
+Two data points have `NA NA`, which should be set to proper machine-readable `NA`:
+
+```{r}
+soju <- mutate(soju,
+               secondary_slogan = if_else(secondary_slogan == 'NA NA',
+                                          NA, secondary_slogan))
+
+# Check:
+
+slice(soju, 265:266) |> pull(secondary_slogan)
+```
+
+Several data points ahve `En.` instead of `EN:`:
+
+```{r}
+soju <- mutate(soju,
+               secondary_slogan = str_replace(secondary_slogan,
+                                              'En\\.', 'EN: '))
+```
+
+For the ones where `secondary_slogan` is English already, double the entry as we did before for the primary slogan so that the translation column is filled:
+
+```{r}
+# Extract IDs that are missing EN:
+
+ids <- filter(soju,
+              !str_detect(secondary_slogan, 'EN: ')) |> pull(id)
+
+# Duplicate them:
+
+soju <- mutate(soju,
+               secondary_slogan = if_else(id %in% ids,
+                                          str_c(secondary_slogan,
+                                                ' EN: ', secondary_slogan),
+                                          secondary_slogan))
+
+# Check:
+
+filter(soju, id %in% ids) |> 
+  pull(secondary_slogan)
+```
+
+Process the secondary slogan similarly:
+
+```{r}
+soju <- soju |> 
+  separate(secondary_slogan, sep = 'EN: ',
+           into = c('secondary_slogan_korean', 'secondary_slogan_english'))
+```
+
+## Source
+
+There are a bunch of sources that are just different specific urls from the same general website. Like, for example, this one:
+
+```{r}
+soju |> 
+  filter(str_detect(source, 'mackiss')) |> 
+  select(source)
+```
+
+For reporting purposes, it'll make more sense to contract these sources. The pattern with all of them is that we want everything up to the first link. Like, for `https://www.ad.co.kr/ad/print/show.cjsp?ukey=1389869`, we will want `https://www.ad.co.kr/`.
+
+```{r}
+soju <- soju |> 
+  mutate(soju, source = str_replace(source, "^(https?://[^/]+).*", "\\1/"))
+
+# Check:
+
+soju |> 
+  sample_n(10) |> 
+  select(source)
+```
+
+Let's further contract the different naver sites `https://m.blog.naver.com/`, `https://post.naver.com/`, `https://newslibrary.naver.com/` etc. We'll set everything that has the string `naver` in it to the most common case. We'll do the same for the multiple `daum` ones.
+
+```{r}
+soju <- soju |> 
+  mutate(source = if_else(str_detect(source, 'naver'),
+                          'https://newslibrary.naver.com/', source),
+         source = if_else(str_detect(source, 'daum'),
+                          'http://blog.daum.net/', source))
+```
+
+
+## Alcohol content
+
+We have two ads for which we do not know the alcohol content, and haven't been able to retrieve this information from anywhere.
+
+```{r}
+filter(soju, is.na(alcohol_content)) |> 
+  select(id, year, company, brand, alcohol_content)
+```
+
+We have a few ads that have more than one alcohol content because there were two different drinks advertised.
+
+```{r}
+filter(soju, str_detect(alcohol_content, '&')) |> 
+  select(id, year, company, brand, alcohol_content) |> 
+  print(n = Inf)
+```
+
+We have discussed as a team that the most sensible solution would be to average the two For most of them, the two numbers are very similar anyway. If we didn't do this, we'd either have to duplicate data points rows for some (which creates redundancy for all variables other than `alcohol_content`), or we'd have to leave them `NA`, which would entail unnecessary data loss.
+
+But first, for reporting these cases, let's check the number and percentage out of the total ads.
+
+```{r}
+filter(soju, str_detect(alcohol_content, '&')) |> 
+  select(id, year, company, brand, alcohol_content) |> 
+  nrow()
+
+# Percentage out of total:
+
+33 / nrow(soju)
+```
+
+We'll proceed by defining a helper function `average_ampersand()` that splits a text vector for '&', then loops through the resulting list using `map()` to make the list first numeric, then take the mean.
+
+```{r}
+average_ampersand <- function(x) {
+  x <- str_split(x, '&') |>
+    map(\(x) mean(as.numeric(x))) |> 
+    unlist()
+  
+  return(x)
+}
+
+## Apply the function:
+
+soju <- mutate(soju,
+               alcohol_content = average_ampersand(alcohol_content))
+```
+
+## Logo
+
+Show the `logo_location` variable:
+
+```{r}
+soju |> 
+  count(logo_location, sort = TRUE)
+```
+
+The `logo_location` variable has some minor issues:
+
+- Let's make it lowercase.
+- There are `(C|c)entre` and `(C|c)enter` versions that need to be collapsed.
+- There is redundancy with respect to `Top right corner` and `Top right`. These are the same (confirmed with Lucien Brown), so we can get rid of ` corner` in the string.
+- Replace `middle` with `center`.
+- Merge `center bottom` and `bottom center`, keeping the latter.
+
+```{r}
+soju <- mutate(soju,
+               logo_location = str_to_lower(logo_location),
+               logo_location = str_replace_all(logo_location, 'entre', 'enter'),
+               logo_location = str_replace_all(logo_location, ' corner', ''),
+               logo_location = str_replace_all(logo_location, 'middle', 'center'),
+               logo_location = str_replace_all(logo_location, 'center bottom',
+                                               'bottom center'))
+```
+
+We will create `logo_horizontal` and `logo_vertical` positions. For those cases that have two logos, we'll only count something if it's consistent across both logos, e.g., `Bottom middle/Bottom right` will receive `bottom` on `logo_vertical`, but `NA` on `logo_horizontal` (since there are two horizontal positions).
+
+```{r}
+# Vectors to match horizontal position:
+
+left_cases <- c('top left', 'bottom left')
+center_cases_h <- c('bottom center', 'top center', 'center', 'center bottom')
+right_cases <- c('top right', 'bottom right', 'top right/bottom right',
+                 'center right')
+
+# Vectors to match vertical position:
+
+top_cases <- c('top left', 'top right', 'top center', 'top left/top right')
+center_cases_v <- c('center', 'center left/center right', 'center right')
+bottom_cases <- c('bottom right', 'bottom left', 'bottom center',
+                  'center bottom', 'bottom center/bottom right')
+
+# Create new variables:
+
+soju <- mutate(soju,
+               logo_horizontal = case_when(logo_location %in% left_cases ~ 'left',
+                                           logo_location %in% center_cases_h ~ 'center',
+                                           logo_location %in% right_cases ~ 'right',
+                                           .default = NA),
+               logo_vertical = case_when(logo_location %in% top_cases ~ 'top',
+                                         logo_location %in% center_cases_v ~ 'center',
+                                           logo_location %in% bottom_cases ~ 'bottom',
+                                           .default = NA))
+```
+
+Check:
+
+```{r}
+# Horizontal:
+
+soju |> 
+  count(logo_location, logo_horizontal)
+
+# Vertical:
+
+soju |> 
+  count(logo_location, logo_vertical)
+```
+
+Then collapse the multi-cases in `logo_location` to a single level `multiple logos`:
+
+```{r}
+soju <- mutate(soju,
+               logo_location = if_else(str_detect(logo_location, '(/)|(and)'),
+                                       'multiple logos', logo_location))
+```
+
+Merge `Words` and `Word` in `logo_modality`:
+
+```{r}
+soju <- mutate(soju,
+               logo_modality = str_replace_all(logo_modality, 'Words', 'Word'))
+```
+
+## Text, slogan and writing features
+
+The `text_count` variable for `id == 81` includes a newspaper text. After discussion, the corrected count should be `52` rather than `842`.
+
+```{r}
+soju <- mutate(soju,
+               text_count = if_else(text_count == 842, 52, text_count))
+```
+
+For `id == 535` and `id == 539`, the `text_count` variable is `NA`, and can safely be set to zero. We checked the ads, and they include text only on the bottle, which we do not count.
+
+```{r}
+soju <- mutate(soju,
+               text_count = if_else(id %in% c(535, 539), 0, text_count))
+```
+
+Make `hanja`, `roman` and `hangul_loan_words` variables lower case:
+
+```{r}
+soju <- mutate(soju,
+               hanja = str_to_lower(hanja),
+               roman = str_to_lower(roman),
+               hangul_loan_words = str_to_lower(hangul_loan_words))
+```
+
+Make reduced variables that code for yes/no for Hanja, Roman letters, and the presence of loan words:
+
+```{r}
+soju <- soju |> 
+  mutate(hanja_red = if_else(hanja == 'no', 'no', 'yes'),
+         roman_red = if_else(roman == 'no', 'no', 'yes'),
+         loan_word_red = if_else(hangul_loan_words == 'no', 'no', 'yes'))
+```
+
+Set missing cases to `no` for `loan_word_red` and `hangul_loan_words`:
+
+```{r}
+soju <- soju |> 
+  mutate(hangul_loan_words = if_else(is.na(hangul_loan_words), 'no', hangul_loan_words),
+         loan_word_red = if_else(is.na(loan_word_red), 'no', loan_word_red))
+```
+
+Create two variables, `any_green` and `any_blue` that look at the development of green and blue over time.
+
+```{r}
+soju <- mutate(soju,
+               any_green = ifelse(str_detect(writing_color, '(G|g)reen'),
+                                  'has green', 'no green'),
+               any_blue = ifelse(str_detect(writing_color, '(B|b)lue'),
+                                  'has blue', 'no blue'))
+```
+
+We'll collapse `Noun (English)` (only 15 cases), `Adjective (English)` (only 9 cases), and `Adverb (English)` (only 1 case) to just `English`.
+
+```{r}
+soju <- mutate(soju,
+               main_slogan_ending_red = ifelse(str_detect(main_slogan_ending, 'English'), 'English', main_slogan_ending))
+```
+
+Create categorical identifier variables:
+
+```{r}
+soju <- mutate(soju,
+               verb_ending = if_else(main_slogan_ending_red == 'Verb', 'yes', 'no'),
+               noun_ending = if_else(main_slogan_ending_red == 'Noun', 'yes', 'no'))
+```
+
+For `secondary_slogan`, let's also collapse the `(English)` cases:
+
+```{r}
+soju <- mutate(soju,
+               secondary_slogan_ending_red = if_else(str_detect(secondary_slogan_ending, 'English'), 'English', secondary_slogan_ending))
+```
+
+For the `font_style` variable, fix typo `Calligrahy` and make `Calligraphy and print` into `Calligraphy` and `Print and calligraphy` into `Print` — as detailed in the codebook, the order here reflects the prominence, so `Calligraphy and print` is mostly calligraphy, and therefore justifies lumping them together.
+
+```{r}
+soju <- mutate(soju,
+               font_style = if_else(font_style == 'Calligrahy',
+                                    'Calligraphy', font_style),
+               font_style_red = case_when(font_style == 'Calligraphy and print' ~ 'Calligraphy',
+                                      font_style == 'Print and calligraphy' ~ 'Print',
+                                      .default = as.character(font_style)))
+```
+
+Create `has_calligraphy` binary variable (no need to create a second one since that's exactly the inverse, so they'd be perfectly correlated in the MCA below):
+
+```{r}
+soju <- mutate(soju,
+               has_calligraphy = if_else(font_style_red == 'Calligraphy', 'yes', 'no'))
+```
+
+Since `Bold and light` for `font_weight` is only two cases, I'll collapse that with `Bold`.
+
+```{r}
+soju <- mutate(soju,
+               font_weight = ifelse(font_weight == 'Bold and light',
+                                    'Bold', font_weight))
+```
+
+Let's look at `slogan_end_verb`, and collapse -nida and -ayo/-eyyeo forms to `contaymal`, and transform Korean `반말` to translitereated `panmal` for plotting purposes. We'll get rid of the four endings that have just one case each. Not worth analyzing these due to the extremely low numbers! For the MCA later, we'll also create a `has_panmal` variable:
+
+```{r}
+# Show:
+
+soju |> 
+  adorn_percentages(slogan_end_verb)
+
+# Reduce:
+
+soju <- mutate(soju,
+               slogan_end_verb_red = case_when(slogan_end_verb == '~요' ~ 'contaymal',
+                                               slogan_end_verb == '~니다' ~ 'contaymal',
+                                               slogan_end_verb == '반말' ~ 'panmal',
+                                               .default = NA),
+               has_panmal = if_else(slogan_end_verb_red == 'panmal', 'yes', 'no'))
+```
+
+## Bottle
+
+In the code book, it says `Yes*` means the drawing of the image of a bottle. Let's make that more transparent:
+
+```{r}
+soju <- mutate(soju,
+               bottle_presence = ifelse(bottle_presence == 'Yes*',
+                                        'Drawing',
+                                        bottle_presence))
+```
+
+For this, we'll collapse `Drawing`, `Superimposed` and `Yes` to `yes`, and `No` stays `no`.
+
+```{r}
+soju <- mutate(soju,
+               has_bottle = if_else(bottle_presence == 'No', 'no', 'yes'))
+```
+
+Extract bottle body and neck height and width using regular expressions. As regular expressions evaluate greedily, `[0-9]+` will pick up `32` out of `32x72`, and `[0-9]+$` will picj up `72` out of the same string. 
+
+```{r}
+soju <- mutate(soju,
+               body_height = str_extract(body_height_by_width, '[0-9]+'),
+               body_width = str_extract(body_height_by_width, '[0-9]+$'),
+               neck_height = str_extract(neck_height_by_width, '[0-9]+'),
+               neck_width = str_extract(neck_height_by_width, '[0-9]+$'),
+               
+               # Convert to numeric:
+               
+               body_height = as.numeric(body_height),
+               body_width = as.numeric(body_width),
+               neck_height = as.numeric(neck_height),
+               neck_width = as.numeric(neck_width))
+
+# Check:
+
+select(soju, body_height_by_width, body_height:body_width,
+       neck_height_by_width, neck_height:neck_width)
+```
+
+Create body and neck height by width ratios:
+
+```{r}
+soju <- mutate(soju,
+               body_ratio = body_height / body_width,
+               neck_ratio = neck_height / neck_width)
+```
+
+Create a variable that is the ratio of ratios:
+
+```{r}
+soju <- mutate(soju,
+               neck_over_body_ratio = neck_ratio / body_ratio)
+```
+
+We'll collapse the `bottle_color` categories, specifically `Olive green` and `Green`, and collapse `Green and clear` and `Black and clear` to their respective colors, and also fix the typo `Geen`. `Clear and brown` will be mapped onto `Clear`, and `Brown and white` to `brown`. We'll achieve most of this by getting rid of any ` and ...` bits so that things will always be merged to the first category. Let's also merge `Brown` and `Black`:
+
+```{r}
+soju <- mutate(soju,
+               bottle_color = str_replace_all(bottle_color, ' and [a-z]+$', ''),
+               bottle_color = if_else(bottle_color == 'Geen', 'Green', bottle_color),
+               bottle_color = if_else(bottle_color == 'Olive green', 'Green', bottle_color),
+               bottle_color = if_else(bottle_color %in% c('Black', 'Brown'),
+                                      'Brown or black', bottle_color))
+```
+
+Create binary variables for MCA later:
+
+```{r}
+soju <- mutate(soju,
+               has_green_bottle = if_else(bottle_color == 'Green', 'yes', 'no'),
+               has_clear_bottle = if_else(bottle_color == 'Clear', 'yes', 'no'),
+               has_black_or_brown_bottle = if_else(bottle_color == 'Brown or black', 'yes', 'no'))
+```
+
+## Model and gender
+
+Make model gender variable lower case:
+
+```{r}
+soju <- mutate(soju,
+               model_gender = str_to_lower(model_gender))
+```
+
+Convert missing cases on `model_gender` to `No model`: these only show hands, in cartoon style.
+
+```{r}
+soju <- mutate(soju,
+               model_gender = if_else(is.na(model_gender), 'no model', model_gender))
+```
+
+Convert `model_gender` variable into `model_gender_red` where cases like `1 Female & 1 Male` are converted to `mixed`, and cases like `3 Males` are converted to `male group` etc. We'll count a non-human model as `no model` and merge `1  male` and `1 male`.
+
+```{r}
+soju <- mutate(soju,
+               model_gender_red = case_when(model_gender == '1 female & 1 male' ~ 'mixed group',
+                                            model_gender == '1 non-human model' ~ 'no model',
+                                            model_gender == '1 male' ~ 'male solo',
+                                            model_gender == '1 female' ~ 'female solo',
+                                            model_gender == '1  male' ~ 'male solo',
+                                            model_gender == '1female' ~ 'female solo',
+                                            model_gender == '6 females & 6 males' ~ 'mixed group',
+                                            model_gender == '5 females & 4 males' ~ 'mixed group',
+                                            model_gender == '5 females & 1 males' ~ 'mixed group',
+                                            model_gender == '3 females & 3 males' ~ 'mixed group',
+                                            model_gender == '3 females & 1 male' ~ 'mixed group',
+                                            model_gender == '2 male' ~ 'male group',
+                                            model_gender == '2 females & 4 males' ~ 'mixed group',
+                                            model_gender == '2 females & 3 males' ~ 'mixed group',
+                                            model_gender == '1 male & 1 non-human model' ~ 'male solo',
+                                            model_gender == '1 females & 13 males' ~ 'mixed group',
+                                            model_gender == '3 males' ~ 'male group',
+                                            model_gender == '2 females & 1 male' ~ 'mixed group',
+                                            model_gender == 'mixed gender group' ~ 'mixed group',
+                                            model_gender == '4 females & 2 males' ~ 'mixed group',
+                                            model_gender == '2 females & 2 males' ~ 'mixed group',
+                                            model_gender == '1 female & 2 males' ~ 'mixed group',
+                                            model_gender == '1 female & 3 males' ~ 'mixed group',
+                                            model_gender == '4 females' ~ 'female group',
+                                            model_gender == '2 females' ~ 'female group',
+                                            model_gender == '2 males' ~ 'male group',
+                                            .default = model_gender))
+```
+
+Create binary `has_model`, `has_female`, `has_group`, `has_mixed`, and `has_male` variables:
+
+```{r}
+soju <- mutate(soju,
+               has_model = if_else(model_gender_red == 'no model', 'no', 'yes'),
+               has_female = if_else(model_gender_red %in% c('female solo', 'female group'), 'yes', 'no'),
+               has_male = if_else(model_gender_red %in% c('male solo', 'male group'), 'yes', 'no'),
+               has_mixed = if_else(model_gender_red == 'mixed group', 'yes', 'no'),
+               has_group = if_else(model_gender_red %in% c('mixed group', 'female group', 'male group'), 'yes', 'no'))
+```
+
+## Bottle shape
+
+Check the shapes of the bottle:
+
+```{r}
+soju |> 
+  adorn_percentages(bottle_shape) |> 
+  print(n = Inf)
+```
+
+Make lowercase:
+
+```{r}
+soju <- mutate(soju,
+               bottle_shape = str_to_lower(bottle_shape))
+```
+
+Map them onto short versus long necks:
+
+```{r}
+# Define helper vectors:
+
+long_neck <- c('long neck',
+               'long thick neck',
+               'long neck and convex shoulder',
+               'long neck and long narrow body',
+               'long and thick neck',
+               'long neck and concave shoulder',
+               'extra long neck and short narrow body',
+               'long neck and long angular narrow body',
+               'long neck and short round body, long neck and short narrow body',
+               'long neck and short rectangular body',
+               'long neck and wide body',
+               'long neck with patterned glass',
+               'long straight neck')
+short_neck <- c('short neck',
+                'short slanted neck and long narrow body',
+                'short neck and long rectangular body',
+                'short neck and long square body',
+                'flask',
+                'short neck and long curved body',
+                'short neck and long round body',
+                'short neck and wide rectangular body',
+                'rectangle',
+                'short and thick neck, short neck and long rectangular body',
+                'short and wide neck',
+                'short and wide neck and body',
+                'short neck and long round body, short neck and long square body')
+
+# Reduced variable:
+
+soju <- mutate(soju,
+               bottle_shape_red = case_when(bottle_shape %in% long_neck ~ 'long neck',
+                                            bottle_shape %in% short_neck ~ 'short neck',
+                                            .default = NA))
+```
+
+## Plants and trees
+
+For the background variable, create a `has_plant` that collapses plants and trees:
+
+```{r}
+soju <- soju |>
+  mutate(plant_background = if_else(plants_trees_background == 'No', 'no', 'yes'))
+```
+
+## Ideophones and sound objects
+
+Check the ideophone and sound object count variables:
+
+```{r}
+# Ideophone word count:
+
+soju |> 
+  filter(!is.na(ideophone_word_count)) |> 
+  pull(ideophone_word_count)
+
+# Sound object word count:
+
+soju |> 
+  filter(!is.na(sound_object_word_count)) |> 
+  pull(sound_object_word_count)
+```
+
+To have a proper count variable that is coded as numeric, we can just extract the first value, and then convert with `as.numeric()`.
+
+```{r}
+soju <- soju |> 
+  mutate(ideophone_word_count = str_sub(ideophone_word_count, 1, 1),
+         sound_object_word_count = str_sub(sound_object_word_count, 1, 1),
+         ideophone_word_count = as.numeric(ideophone_word_count),
+         sound_object_word_count = as.numeric(sound_object_word_count))
+
+# Check ideophone word count:
+
+soju |> 
+  filter(!is.na(ideophone_word_count)) |> 
+  pull(ideophone_word_count)
+
+# Check sound object word count:
+
+soju |> 
+  filter(!is.na(sound_object_word_count)) |> 
+  pull(sound_object_word_count)
+```
+
+Make a binary variable out of this where anything above 1 is 1 (present) and anything else is 0. This makes sense since we have very few ads that have multiple ideophones or sound objects anyway, and these are often repetitions of the same one.
+
+```{r}
+soju <- soju |> 
+  mutate(ideophone_red = if_else(is.na(ideophone_word_count), 'no', 'yes'),
+         sound_object_red = if_else(is.na(sound_object_word_count), 'no', 'yes'))
+```
+
+
+# Overview
+
+## Overall data
+
+How many ads are there in total?
+
+```{r}
+nrow(soju)
+```
+
+## Source
+
+Where were the ads found?
+
+```{r}
+soju |>
+  adorn_percentages(source) |> 
+  arrange(desc(n)) |> 
+  print(n = Inf)
+```
+
+Write that into a table:
+
+```{r}
+soju |>
+  adorn_percentages(source) |> 
+  arrange(desc(n)) |> 
+  write_excel_csv('../summary_tables/source_counts.csv')
+```
+
+
+What medium are the ads published in?
+
+```{r}
+soju |> 
+  adorn_percentages(medium)
+```
+
+## Data points over time
+
+What's the range of years?
+
+```{r}
+range(soju$year)
+```
+
+How many data points are post-2000?
+
+```{r}
+soju |> 
+  mutate(post_2000 = if_else(year > 2000, 'post-2000', 'pre-2000')) |> 
+  adorn_percentages(post_2000)
+```
+
+70% of the data are from after the 2000's.
+
+What about using 1990 as a split?
+
+```{r}
+soju |> 
+  mutate(post_1990 = if_else(year > 1990, 'post-1990', 'pre-1990')) |> 
+  adorn_percentages(post_1990)
+```
+
+We want to create a histogram that shows how many data points we have for each year, and we'll also add the totals per decade at the bottom. These points should occur in between the tick marks '1960' and '1970', '1970' and '1980', and so on, which means we'll add +5 to the `year_binned` variable to plot them halfway in between the tick marks.
+
+Count items per decade and format the tibble so that it can serve as input for the ggplot below.
+
+```{r}
+decade_totals <- soju |> 
+  count(year_binned)
+
+# Show:
+
+decade_totals
+```
+
+What years do we have?
+
+```{r}
+# Plot core:
+
+year_p <- soju |> 
+  count(year, sort = TRUE) |> 
+  ggplot(aes(x = year, y = n)) +
+  geom_vline(xintercept = seq(1960, 2030, 10),
+             linetype = 'dashed', size = 1/4,
+             col = 'grey') +
+  geom_col(fill = 'grey40')
+
+# Scales and axes:
+
+year_p <- year_p +
+  scale_x_continuous(limits = c(1955, 2029),
+                     expand = c(0, 0),
+                     breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 70),
+                     breaks = seq(0, 60, 10)) +
+  xlab('Year') +
+  ylab('Number of ads')
+
+# Show and save:
+
+year_p
+ggsave('../figures/pdf/year_overview.pdf', year_p,
+       width = 6.2, height = 3.4)
+ggsave('../figures/png/year_overview.png', year_p,
+       width = 6.2, height = 3.4)
+```
+
+## Companies, brands and locations
+
+Example of company/brand to discuss in the paper:
+
+```{r}
+filter(soju, company == 'JinRo 진로') |>
+  count(brand, sort = TRUE)
+```
+
+How is it distributed by company? Let's compute a summary table and save this outside of R. In this table, we'll also add the brands per company. I'll use `write_excel_csv()` below as an easy way to ensure that Korean characters are encoded correctly. We'll also add the year the first ad occurred.
+
+```{r}
+# Compute counts per company:
+
+company_tab <- soju |> 
+  adorn_percentages(company) |> 
+  rename(percentage = p)
+
+# Add brands per company:
+
+company_tab <- soju |> 
+  count(company, brand) |> 
+  count(company) |> 
+  rename(brands = n) |> 
+  right_join(company_tab) |> 
+  relocate(brands, .after = last_col())
+
+# Add year of first ad in data:
+
+company_tab <- soju |> 
+  group_by(company) |> 
+  summarize(`first ad` = min(year),
+            `last ad` = max(year)) |> 
+  right_join(company_tab) |> 
+  relocate(`first ad`, .after = last_col()) |> 
+  relocate(`last ad`, .after = last_col()) |> 
+  arrange(desc(n))
+
+# Make all column names start with capital letters:
+
+company_tab <- rename_all(company_tab, str_to_title)
+
+# Show and save:
+
+company_tab |> 
+  print(n = Inf)
+
+write_excel_csv(company_tab, '../summary_tables/company_counts.csv')
+```
+
+32 different companies, with JinRo being the clear winner (34%), but overall still quite balanced.
+
+Worth pointing out that the first three companies are more than 60% of the data:
+
+```{r}
+soju |> 
+  count(company, sort = TRUE) |> 
+  mutate(prop = n / sum(n)) |> 
+  slice_head(n = 3) |> 
+  summarize(majority_proportion = sum(prop))
+```
+
+What about locations?
+
+```{r}
+# Show:
+
+soju |> 
+  adorn_percentages(production_area) |> 
+  print(n = Inf)
+
+# Externalize:
+
+soju |> 
+  adorn_percentages(production_area) |> 
+  write_csv('../summary_tables/production_area_detailed.csv')
+```
+
+More coarse locations is more useful for us for reporting so as to not overwhelm the reader with (in this case) rather unnecessary detail:
+
+```{r}
+# Show:
+
+soju |> 
+  adorn_percentages(production_area_red) |> 
+  print(n = Inf)
+
+# Externalize:
+
+soju |> 
+  adorn_percentages(production_area_red) |> 
+  write_csv('../summary_tables/production_area.csv')
+```
+
+## Black-and-white versus color ads
+
+The majority seem to be color ads, and not black and white:
+
+```{r}
+soju |> 
+  adorn_percentages(overall_color)
+```
+
+Clearly, the `Black and white` are more likely to come from the past. Here's the average year of publication for these two categories:
+
+```{r}
+soju |> 
+  group_by(overall_color) |> 
+  summarize(year = mean(year))
+```
+
+Yeah, so the black and white ones are much older, as is to be expected. A more sensible quantity to report might be this:
+
+```{r}
+soju |> 
+  count(year_binned, overall_color) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2) * 100,
+         p = str_c(p, '%'))
+```
+
+When was the last black and white ad published?
+
+```{r}
+soju |> 
+  filter(overall_color == 'Black and white') |> 
+  arrange(desc(year)) |> 
+  select(overall_color, company, brand, year)
+```
+
+Still, quite a few in the 90's. I think it would be good to know whether these are genuinely black and white, or whether we just happen to have black and white versions of them.
+
+When was the first color ad?
+
+```{r}
+soju |>
+  filter(overall_color == 'Color') |> 
+  arrange(year) |> 
+  select(overall_color, company, brand, year)
+```
+
+Only the Jinro and BaekHwa ones are colored in the 70's, and only Bohae and BaekHwa in the 80's, then all color ones are from later than that. We'll have to take this into account when thinking about color trends over time later. The information that we can have about color only kicks in much later. We can't really make strong inferences about color for anything before the 90's.
+
+## Alcohol content
+
+What are the ads that we do not have the alcohol content for?
+
+```{r}
+filter(soju, is.na(alcohol_content)) |> 
+  select(company, brand, year)
+```
+
+Check the distribution of alcohol content, irrespective of time:
+
+```{r}
+alcohol_counts <- soju |> 
+  filter(!is.na(alcohol_content)) |>
+  count(alcohol_content, sort = TRUE) |> 
+  print(n = Inf)
+
+# Show:
+
+alcohol_counts
+```
+
+Make a plot of this:
+
+```{r}
+alcohol_counts |> 
+  ggplot(aes(x = alcohol_content, y = n)) +
+  geom_col(col = 'black') + 
+  xlab('Alcohol content') +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 250)) +
+  scale_x_continuous(limits = c(0, 40),
+                     breaks = seq(0, 40, 5))
+```
+
+Not the most informative plot, so we won't work on a publication ready version. That said, something interesting is of note here: We know from the literature on round numbers in advertising and marketing that round numbers are preferred, which explains the peaks at 35, 30, 25, and 20. There is no peak at 15, but then it really peaks at 17. This must have to do with the legal limit, and the desire for campnies to fall just under that.
+
+How many soju ads are about drinks that have at least 30°?
+
+```{r}
+soju |> 
+  mutate(hard_liquor = if_else(alcohol_content >= 30, 'hard', 'soft')) |> 
+  filter(!is.na(alcohol_content)) |> 
+  adorn_percentages(hard_liquor)
+```
+
+What are the mean and median alcohol contents? And the range?
+
+```{r}
+mean(soju$alcohol_content, na.rm = TRUE)
+median(soju$alcohol_content, na.rm = TRUE)
+range(soju$alcohol_content, na.rm = TRUE)
+```
+
+For reporting, what are the companies with the lowest and largest alcohol content?
+
+```{r}
+# Min:
+
+soju |> 
+  filter(alcohol_content == min(alcohol_content, na.rm = TRUE)) |> 
+  select(year, company, brand, alcohol_content)
+
+# Max:
+
+soju |> 
+  filter(alcohol_content == max(alcohol_content, na.rm = TRUE)) |> 
+  select(year, company, brand, alcohol_content)
+```
+
+Let's check for `16.9` and `25` and `19.5` - the three most common types of alcohol contents - the composition of companies.
+
+```{r}
+filter(soju, alcohol_content == 16.9) |> 
+  adorn_percentages(company)
+```
+
+So, it's actually a few different companies. Could this be that 17% was a legal boundary and they try to be just beneath that?
+
+Same for 25:
+
+```{r}
+filter(soju, alcohol_content == 25) |> 
+  adorn_percentages(company)
+```
+
+Also quite a few different ones.
+
+```{r}
+filter(soju, alcohol_content == 19.5) |> 
+  adorn_percentages(company)
+```
+
+Also again four companies... could 20% be another legal boundary.
+
+## Alcohol content: time trend
+
+Let's look at the alcohol content over time, a simple average plot as a quick-and-dirty first pass.
+
+```{r}
+soju |> 
+  group_by(year) |> 
+  summarize(alcohol_mean = mean(alcohol_content, na.rm = TRUE)) |> 
+  ggplot(aes(x = year, y = alcohol_mean)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 40),
+                     breaks = seq(0, 40, 5)) +
+  ylab('Average alcohol content')
+```
+
+Fit a Bayesian GAM:
+
+```{r eval = FALSE}
+alcohol_mdl <- brm(bf(alcohol_content ~ 1 +
+                        s(year) +
+                        (1|company)),
+                   data = filter(soju, !is.na(alcohol_content)),
+                   family = gaussian,
+                   
+                   # MCMC settings:
+                   
+                   cores = 4, seed = 42,
+                   chains = 4, iter = 6000, warmup = 4000,
+                   control = list(adapt_delta = 0.99))
+
+# Save model:
+
+save(alcohol_mdl, file = '../models/alcohol_mdl.RData')
+```
+
+**Note**: Treedepth warning but diagnostics below show that there's no divergent transitions and other MCMC diagnostics also look fine.
+
+**Bodo action point:** Need to investigate and learn about prior choices for GAMs.
+
+Load the model:
+
+```{r}
+load('../models/alcohol_mdl.RData')
+```
+
+Perform hypothesis test for 1960 versus 2020 alcohol content:
+
+```{r}
+# Year 1 posterior samples:
+
+year_1 <- alcohol_mdl |> 
+  as_draws_df() |> 
+  pull(`s_syear_1[1]`)
+
+# Year 8 posterior samples:
+
+year_8 <- alcohol_mdl |> 
+  as_draws_df() |> 
+  pull(`s_syear_1[8]`)
+
+# Probability of first time point being smaller than last:
+
+sum(year_1 < year_8) / length(year_1)
+```
+
+**Bodo action point**:
+- Can I actually do this? What does this mean? Need to investigate.
+- Also need to check the direction in which this is going, i.e., what is 1, and what is 8.
+
+```{r}
+# Extract posterior for bs_syear_1 effect:
+
+year_samples <- alcohol_mdl |> 
+  as_draws_df() |> 
+  pull(bs_syear_1)
+
+# Check how many of them are negative:
+
+sum(year_samples < 0) / length(year_samples)
+```
+
+### Model diagnostics
+
+Check MCMC trace and density overlays across chains:
+
+```{r eval = FALSE}
+mcmc_trace(alcohol_mdl)
+mcmc_dens_overlay(alcohol_mdl)
+```
+
+Looks good.
+
+```{r}
+neff_ratio(alcohol_mdl)
+```
+
+Check posterior predictive simulations to assess model plausibility:
+
+```{r}
+pp_check(alcohol_mdl, ndraws = 100)
+```
+
+The model clearly can't account for all trends. This could be some of the clusters in the data emerging from the brands, but fitting both company and brand random intercepts turns out to be impossible because there's not enough companies who have multiple brands, i.e., the two encode fairly similar pieces of information that are hard to disentangle when they're both in the model. It's still quite good overall, all things considered.
+
+### Plot alcohol model and data
+
+Get the marginal effect to put on top of the plot. Save it in an object for plotting and also show:
+
+```{r}
+alcohol_conditional <- conditional_effects(alcohol_mdl)$year
+
+# Show: 
+
+alcohol_conditional
+```
+
+Let's make a better plot with the raw data points:
+
+```{r}
+# Plot core:
+
+alcohol_p <- soju |> 
+  ggplot(aes(x = year, y = alcohol_content)) +
+  geom_ribbon(data = alcohol_conditional,
+              mapping = aes(x = year, ymin = lower__, ymax = upper__),
+              fill = 'grey') +
+  geom_line(data = alcohol_conditional,
+            mapping = aes(x = year, y = estimate__),
+            col = 'purple', size = 1.35) +
+  geom_jitter(alpha = 0.2,
+              width = 0.17,
+              height = 0.17)
+
+# Axes and labels:
+
+alcohol_p <- alcohol_p +
+  scale_x_continuous(limits = c(1955, 2029),
+                     expand = c(0, 0),
+                     breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 55),
+                     breaks = seq(0, 50, 5),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Alcohol content °')
+
+# Show and save:
+
+alcohol_p
+ggsave('../figures/pdf/alcohol_time_trend.pdf', alcohol_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/alcohol_time_trend.png', alcohol_p,
+       width = 5.8, height = 3.7)
+```
+
+To give one-number summaries of the overall trend, let's look at the average for the 1960s and the average for the 2010s.
+
+```{r}
+soju |> 
+  group_by(year_binned) |> 
+  summarize(M = mean(alcohol_content, na.rm = TRUE))
+```
+
+## Flavor
+
+Whether it is flavored or not:
+
+```{r}
+soju |> 
+  adorn_percentages(flavoured_soju)
+```
+
+From when are these flavored sojus, and which brands are they?
+
+```{r}
+soju |> 
+  filter(flavoured_soju == 'Yes') |> 
+  select(year, company, brand, alcohol_content, flavour) |> 
+  arrange(year) |> 
+  print(n = Inf)
+```
+
+The earliest flavored soju is from 2015.
+
+What is the average alcohol content?
+
+```{r}
+soju |> 
+  group_by(flavoured_soju) |> 
+  summarize(alc_mean = mean(alcohol_content, na.rm = TRUE),
+            alc_min = min(alcohol_content, na.rm = TRUE),
+            alc_max = max(alcohol_content, na.rm = TRUE))
+```
+
+What flavors?
+
+```{r}
+soju |> 
+  filter(flavoured_soju == 'Yes') |> 
+  adorn_percentages(flavour)
+```
+
+
+# Extracting data for qualitative analysis content
+## Sampling for alcohol content across time
+
+For the qualitative analysis, we want to sample 120 ads, 20 per decade, but we *also* want to make sure we get the extremes in alcohol content.
+
+For the 1980's we just have 16 ads, so we take all. Let's exclude the 1980's so we can use `group_by()` and `sample_n()` strategically.
+
+```{r}
+soju_no_1980 <- soju |> 
+  filter(year_binned != 1980)
+```
+
+Merge 2010-2020+ since there's only a few years after 2020:
+
+```{r}
+set.seed(42)
+
+soju_sample <- soju_no_1980 |> 
+  filter(!is.na(alcohol_content)) |> 
+  mutate(year_binned = if_else(year_binned > 2010, 2010, year_binned)) |> 
+  group_by(year_binned) |> 
+  sample_n(20)
+```
+
+Reappend the missing 80's:
+
+```{r}
+soju_sample <- bind_rows(soju_sample,
+                         filter(soju, year_binned == 1980))
+```
+
+Make a plot of this:
+
+```{r}
+soju_sample |> 
+  ggplot(aes(x = year, y = alcohol_content)) +
+  geom_smooth() +
+  geom_point() +
+  ylim(10, 45) +
+  theme_classic()
+```
+
+Topped up with four of the really high alcohol content ones and low alcohol content ones that are missing. Let's take two Mackis and two JinRo to balance things out for the high alcohol content, and then 2 random ones from the low alcohol content (they are all the same brand anyway), and we get to 120:
+
+```{r}
+set.seed(1)
+low_content <- filter(soju, alcohol_content == 13) |> 
+  group_by(year_binned) |> 
+  sample_n(size = 2)
+
+# Mackis
+
+set.seed(666)
+high_content <- soju |>
+  filter(year_binned > 2010,
+         alcohol_content > 20) |> 
+  group_by(company) |> 
+  sample_n(size = 2)
+
+# Reappend:
+
+soju_sample <- bind_rows(soju_sample, high_content) |> 
+  bind_rows(low_content)
+```
+
+Double check duplicates:
+
+```{r}
+filter(soju_sample, duplicated(id))
+```
+
+Good.
+
+Any `NA`s for alcohol content?
+
+```{r}
+soju_sample[is.na(soju_sample$alcohol_content), ]
+```
+
+None.
+
+Make a plot of this:
+
+```{r}
+soju_sample |> 
+  ggplot(aes(x = year, y = alcohol_content)) +
+  geom_smooth() +
+  geom_point() +
+  ylim(10, 45) +
+  theme_classic()
+```
+
+Get all the file names:
+
+```{r}
+all_files <- str_c('../all_images/', soju_sample$item, '.JPG')
+```
+
+Loop:
+
+```{r}
+for (file in all_files) {
+  file.copy(file, '../all_images_sample/')
+}
+```
+
+Filename for `217_1998_23_JinRo_Sunhan Jinro_002.JPG` is different, so copied it over by hand.
+
+Used `579_2012_19_JinRo_Chamisul Fresh_002.JPG` instead of `id == 572` (the next one over from the same brand)  because 001 also has beer. 217 had to be hand-copied over.
+
+Exchange:
+
+```{r}
+soju_sample[soju_sample$id == 579, ] <- soju[soju$id == 572, ]
+```
+
+Write it to table:
+
+```{r}
+write_csv(soju_sample, '../data/soju_sample_120.csv')
+```
+
+This is the file that will be used for qualitative analysis.
+
+## Other sampling approach
+
+*Not* merge 2010-2020+ this time around:
+
+```{r}
+set.seed(42)
+
+soju_sample <- soju_no_1980 |> 
+  filter(!is.na(alcohol_content)) |> 
+  group_by(year_binned) |> 
+  sample_n(20)
+```
+
+Now take the `soju_1980` and reappend:
+
+```{r}
+soju_sample <- bind_rows(soju_sample,
+                         filter(soju, year_binned == 1980))
+```
+
+Get rid of group info:
+
+```{r}
+soju_sample <- soju_sample |> 
+  ungroup()
+```
+
+
+Check:
+
+```{r}
+any(is.na(soju_sample$alcohol_content))
+
+filter(soju_sample,
+       duplicated(id))
+```
+
+Other group:
+
+```{r}
+set.seed(1)
+low_content <- filter(soju, alcohol_content == 13) |> 
+  group_by(year_binned) |> 
+  sample_n(size = 1)
+
+# Mackis
+
+set.seed(666)
+high_content <- soju |>
+  filter(year_binned > 2010,
+         alcohol_content > 20) |> 
+  group_by(company) |> 
+  sample_n(size = 1)
+
+# Reappend:
+
+soju_sample <- bind_rows(soju_sample, high_content) |> 
+  bind_rows(low_content)
+```
+
+Make a plot of this:
+
+```{r}
+soju_sample |> 
+  ggplot(aes(x = year, y = alcohol_content)) +
+  geom_smooth() +
+  geom_point() +
+  ylim(10, 45) +
+  theme_classic()
+```
+
+Used `579_2012_19_JinRo_Chamisul Fresh_002.JPG` instead of `id == 572` (the next one over from the same brand)  because 001 also has beer. 217 had to be hand-copied over.
+
+Exchange:
+
+```{r}
+soju_sample[soju_sample$id == 579, ] <- soju[soju$id == 572, ]
+```
+
+Get all the file names:
+
+```{r}
+all_files <- str_c('../all_images/', soju_sample$item, '.JPG')
+```
+
+Loop:
+
+```{r}
+for (file in all_files) {
+  file.copy(file, '../all_images_2020sep/')
+}
+```
+
+Filename for `217_1998_23_JinRo_Sunhan Jinro_002.JPG` is different, so copied it over by hand.
+
+Write:
+
+```{r}
+write_csv(soju_sample, '../data/soju_sample_2020s_separate.csv')
+```
+
+This is the file that will be used for qualitative analysis.
+
+# Individual results
+
+In this section, we will look at each variable in turn, providing one-dimensional snapshots of each development over time.
+
+## Textual content and typography
+
+### Text count
+
+Look at the range of the `text_count` variable:
+
+```{r}
+range(soju$text_count, na.rm = TRUE)
+```
+
+Which ones are these extreme points?
+
+```{r}
+# Shortest ads (no words):
+
+filter(soju, text_count == 0) |> 
+  select(id, year, company, brand)
+
+# Longest ad:
+
+filter(soju, text_count == max(text_count)) |> 
+  select(id, year, company, brand)
+```
+
+Check the average number of `text_count`, grand average, and then across time:
+
+```{r}
+# Grand average:
+
+soju |> 
+  summarize(M = mean(text_count))
+
+# Over time:
+
+soju |> 
+  group_by(year_binned) |> 
+  summarize(M = mean(text_count))
+```
+
+Let's show the distribution of text counts (histogram):
+
+```{r}
+soju |> 
+  count(text_count, sort = TRUE) |> 
+  ggplot(aes(x = text_count, y = n)) +
+  geom_col(col = 'black') +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 30),
+                     breaks = seq(0, 30, 5))
+```
+
+Quite a nice spread.
+
+Calculate and plot the average text count per year.
+
+```{r}
+soju |> 
+  group_by(year_binned) |> 
+  summarize(text_mean = mean(text_count)) |>
+  ggplot(aes(x = year_binned, y = text_mean, group = 1)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 300),
+                     breaks = seq(0, 300, 50))
+```
+
+Weird shape. Could be due to binning. Let's see how the trend looks if we average by continuous year:
+
+```{r}
+soju |> 
+  group_by(year) |> 
+  summarize(text_mean = mean(text_count)) |>
+  ggplot(aes(x = year, y = text_mean, group = 1)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 300),
+                     breaks = seq(0, 300, 50))
+```
+
+It definitely looks like a real trend on first pass, but may be worth checking how it's driven by certain ads. So, first ads had little text, then more, peaking in the 80's, then less and less text — quite systematically so! — over the last three decades.
+
+Let's model this using a negative binomial GAMM:
+
+```{r eval = FALSE}
+text_count_mdl <- brm(bf(text_count ~ 1 +
+                        s(year) +
+                        (1|company)),
+                   data = soju,
+                   family = negbinomial(),
+                   
+                   # MCMC settings:
+                   
+                   cores = 4, seed = 42,
+                   chains = 4, iter = 6000, warmup = 4000,
+                   control = list(adapt_delta = 0.99))
+
+# Save model:
+
+save(text_count_mdl, file = '../models/text_count_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/text_count_mdl.RData')
+```
+
+Check model:
+
+```{r}
+text_count_mdl
+```
+
+Get the marginal effect. Save it in an object for plotting and also show:
+
+```{r}
+text_count_conditional <- conditional_effects(text_count_mdl)$year
+
+# Show: 
+
+text_count_conditional
+```
+
+Let's make a better plot with the raw data points:
+
+```{r}
+# Plot core:
+
+text_count_p <- soju |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(data = text_count_conditional,
+              mapping = aes(x = year, ymin = lower__, ymax = upper__),
+              fill = 'grey') +
+  geom_line(data = text_count_conditional,
+            mapping = aes(x = year, y = estimate__),
+            col = 'purple', size = 1.35) +
+  geom_jitter(mapping = aes(color = medium,
+                            y = text_count,
+                            shape = medium),
+              alpha = 0.5,
+              width = 0.17,
+              height = 2)
+
+# Axes and labels:
+
+text_count_p <- text_count_p +
+  scale_x_continuous(limits = c(1955, 2029),
+                     expand = c(0, 0),
+                     breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 500),
+                     breaks = seq(0, 500, 100),
+                     expand = c(0, 0)) +
+  scale_shape_manual(values = c(17, 16, 15)) +
+  scale_color_manual(values = c('black', 'purple', 'darkgreen')) +
+  xlab('Year') +
+  ylab('Text count') +
+  theme(legend.position = 'top',
+        legend.title = element_blank())
+
+# Show and save:
+
+text_count_p
+ggsave('../figures/pdf/text_count_time_trend.pdf', text_count_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/text_count_time_trend.png', text_count_p,
+       width = 5.8, height = 3.7)
+```
+
+### Font style
+
+### Font weight
+
+## Script
+
+### Hanja
+
+Is there hanja, i.e., Chinese characters?
+
+```{r}
+soju |> 
+  adorn_percentages(hanja) |> 
+  print(n = Inf)
+```
+
+Easier to just look at overall levels:
+
+```{r}
+soju |> 
+  adorn_percentages(hanja_red)
+```
+
+We'll use the `yes/no` variable for looking at time trends, but can look at whether hanja was first dropped in the main slogan etc. I could imagine that there was a gradual transition away from hanja's importance over time, with less and less elements containing that.
+
+Look at the time trend for the reduced variable `hanja_red` (Yes/No) as a proportion and a stacked bar plot:
+
+```{r}
+# Plot core:
+
+hanja_bar_p <- soju |> 
+  count(year_binned, hanja_red) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = hanja_red)) +
+  geom_col(col = 'black')
+
+# Axes and labels:
+
+hanja_bar_p <- hanja_bar_p +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Show:
+
+hanja_bar_p
+```
+
+Clear temporal trend with less Hanja over time. It'll be interesting to look at the few modern ones that have Hanja, so the post-2015 ones in there. Perhaps in those ads it'll have a special purpose? It could signal oldschoolness, for example. Here's the newest ads with hanja:
+
+```{r}
+soju |> 
+  filter(hanja_red == 'yes',
+         year > 2015) |> 
+  select(id, company, brand, hanja) |> 
+  print(n = Inf)
+```
+
+They are mostly these specific brands. Looking at the ads, it seems that this is desired to give the ads a retro feel.
+
+For reporting, here is proportion of Hanja counted by decade (`year_binned`):
+
+```{r}
+soju |> 
+  count(year_binned, hanja_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%')) |> 
+  filter(hanja_red != 'no')
+```
+
+Build a model of `p(y = has hanja)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               hanja_red = factor(hanja_red, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+hanja_mdl <- brm(bf(hanja_red ~ 1 +
+                        s(year) +
+                        (1|company)),
+                 data = soju,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(hanja_mdl, file = '../models/hanja_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/hanja_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(hanja_mdl, ndraws = 100)
+pp_check(hanja_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+hanja_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+hanja_mdl_df <- conditional_effects(hanja_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+hanja_p <- hanja_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+hanja_p <- hanja_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1.05),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Proportion of Hanja')
+
+# Show and save:
+
+hanja_p
+ggsave('../figures/pdf/hanja.pdf', hanja_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/hanja.png', hanja_p,
+       width = 5.8, height = 3.7)
+```
+
+### Roman letters
+
+What about the presence of `roman` letters?
+
+```{r}
+soju |> 
+  adorn_percentages(roman) |> 
+  print(n = Inf)
+```
+
+Same as for `hanja` variable, we may want to look at the subcategories of `yes` cases later. Like, could it be interesting to see the continuous "creep" of Roman characters into different aspects of the ads.
+
+```{r}
+soju |> 
+  adorn_percentages(roman_red)
+```
+
+Anyway, to look at time trends, using the Yes/No variable `roman_red`:
+
+```{r}
+soju |> 
+  count(year_binned, roman_red) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = roman_red)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Proportionally definitely much more roman over time, although perhaps a bit back in 2015-2025. Perhaps a backlash against modernization and wanting to be more Korean again, in pursuit of a "retro" feel.
+
+What are the earliest ads with Roman letters?
+
+```{r}
+soju |> 
+  filter(roman_red == 'yes') |> 
+  arrange(year) |> 
+  select(id, company, brand, year, hanja_red, roman_red)
+```
+
+For reporting, here is proportion of Hanja counted by decade (`year_binned`):
+
+```{r}
+soju |> 
+  count(year_binned, roman_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%')) |> 
+  filter(roman_red != 'no')
+```
+
+Is there any relation between having hanja and roman characters?
+
+```{r}
+soju |> 
+  count(hanja_red, roman_red) |> 
+  group_by(hanja_red) |> 
+  mutate(prop = n / sum(n))
+```
+
+Not too much, but a little bit. Those ads that have no hanja, have a slightly higher percentage of Roman letters (75% as opposed to 71%).
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               roman_red = factor(roman_red, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+roman_mdl <- brm(bf(roman_red ~ 1 +
+                      s(year) +
+                      (1|company)),
+                 data = soju,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(roman_mdl, file = '../models/roman_mdl.RData')
+```
+
+Load model:
+
+```{r}
+load('../models/roman_mdl.RData')
+```
+
+Check model:
+
+```{r}
+roman_mdl
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(roman_mdl, ndraws = 100)
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+roman_mdl_df <- conditional_effects(roman_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+roman_p <- roman_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+roman_p <- roman_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of Roman letters')
+
+# Show and save:
+
+roman_p
+ggsave('../figures/pdf/roman.pdf', roman_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/roman.png', roman_p,
+       width = 5.8, height = 3.7)
+```
+
+
+### Hangul loan words
+
+What about Hangul loan words?
+
+```{r}
+soju |> 
+  count(hangul_loan_words, sort = TRUE)
+```
+
+Check Hangul loan words with the `loan_word_red` variable:
+
+```{r}
+soju |> 
+  adorn_percentages(loan_word_red)
+```
+
+Make a temporal trend plot for the loan words, using `loan_word_red`:
+
+```{r}
+soju |> 
+  count(year_binned, loan_word_red) |> 
+  filter(!is.na(loan_word_red)) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = loan_word_red)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Definitely more loan words over time. Very few proportionally in the early years. Perhaps zoom into those and see what's going on there? What's the earliest years that have loan words?
+
+```{r}
+soju |> 
+  filter(loan_word_red == 'yes') |> 
+  arrange(year) |> 
+  select(id, company, brand, year)
+```
+
+It's really very few pre-70's, so worth having a look at to see what's going on with these ads that are first-movers for loan words.
+
+Let's compute the time trend for reporting like this:
+
+```{r}
+soju |> 
+  count(year_binned, loan_word_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%')) |> 
+  filter(loan_word_red != 'no')
+```
+
+I suspect there may be stronger relations between presence of Roman and loan words?
+
+```{r}
+soju |> 
+  count(roman_red, loan_word_red) |> 
+  group_by(roman_red) |> 
+  mutate(prop = n / sum(n))
+```
+
+Yes, so, those ads that have Roman characters are also proportionally speaking much more likely to contain loan words (38%) than those ads that don't have Roman characters (22%).
+
+Whata bout the relationship between loan words and hanja?
+
+```{r}
+soju |> 
+  count(hanja_red, loan_word_red) |> 
+  group_by(hanja_red) |> 
+  mutate(prop = n / sum(n))
+```
+
+Mmmh, this seems a bit counter-intuitive. So, those ads that *don't* have hanja have proportionally more loan words (36%) than those words that *do* (29%)? Could this be that this is because the more "oldschool" ads that include hanja are also more likely to spell loan words in Hangul, rather than using Roman letters?
+
+```{r}
+hanja_roman_loan_tab <- with(filter(soju, !is.na(roman_red),
+            !is.na(loan_word_red)),
+     table(hanja_red, loan_word_red, roman_red))
+
+hanja_roman_loan_tab
+```
+
+**Action point 13:** Think about the three-way relationship between hanja ~ roman letters ~ loan words.
+
+Build a model of `p(y = has loan word)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               loan_word_red = factor(loan_word_red, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+loan_mdl <- brm(bf(loan_word_red ~ 1 +
+                     s(year) +
+                     (1|company)),
+                data = soju,
+                family = bernoulli,
+                 
+                # MCMC settings:
+                   
+                cores = 4, seed = 42,
+                chains = 4, iter = 6000, warmup = 4000,
+                control = list(adapt_delta = 0.99,
+                               max_treedepth = 12))
+
+# Save model:
+
+save(loan_mdl, file = '../models/loan_mdl.RData')
+```
+
+**Bodo action point**: Need to get rid of 13(!!) divergent transitions in MCMC sampling.
+
+Load:
+
+```{r}
+load('../models/loan_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(loan_mdl, ndraws = 100)
+pp_check(loan_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+loan_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+loan_mdl_df <- conditional_effects(loan_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+loan_p <- loan_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+loan_p <- loan_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of loan word')
+
+# Show and save:
+
+loan_p
+ggsave('../figures/pdf/loan.pdf', loan_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/loan.png', loan_p,
+       width = 5.8, height = 3.7)
+```
+
+### Writing direction
+
+Let's look at vertical left/right writing, `vertical_RL_writing`:
+
+```{r}
+soju |> 
+  adorn_percentages(vertical_RL_writing) |> 
+  print(n = Inf)
+```
+
+What are the vertical right-left ones, that is, the traditional writing direction?
+
+```{r}
+soju |> 
+  filter(vertical_RL_writing == 'Yes') |> 
+  select(id, year, company, brand) |> 
+  arrange(desc(year)) |> 
+  print(n = Inf)
+```
+
+What are the vertical left-to-right ones?
+
+```{r}
+soju |> 
+  filter(vertical_RL_writing == 'No (vertical_LR)') |> 
+  select(id, year, company, brand)
+```
+
+We will make both `No`'s into a singular category, vertical writing direction versus horizontal:
+
+```{r}
+soju <- soju |> 
+  mutate(vertical_red = if_else(vertical_RL_writing == 'No',
+                                'horizontal', 'vertical'))
+
+# Check:
+
+soju |> 
+  adorn_percentages(vertical_red)
+```
+
+Anyway, to look at time trends, using the Yes/No variable `roman_red`:
+
+```{r}
+soju |> 
+  count(year_binned, vertical_red) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = vertical_red)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The vertical writing orientation was present in the 1960's and then really drops off.
+
+For reporting, here is proportion of horizontal by decade (`year_binned`):
+
+```{r}
+soju |> 
+  count(year_binned, vertical_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%'))
+```
+
+Build a model of the vertical ones:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               vertical_red = factor(vertical_red, levels = c('horizontal', 'vertical')))
+
+# Generalized additive logistic regression model (with time splines):
+
+direction_mdl <- brm(bf(vertical_red ~ 1 +
+                          s(year) +
+                          (1|company)),
+                 data = soju,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(direction_mdl, file = '../models/direction_mdl.RData')
+```
+
+Load model:
+
+```{r}
+# load('../models/direction_mdl.RData')
+```
+
+Check model:
+
+```{r}
+# direction_mdl
+```
+
+Show posterior predictive simulations:
+
+```{r}
+# pp_check(direction_mdl, ndraws = 100)
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+# direction_mdl_df <- conditional_effects(direction_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# # Plot core:
+# 
+# direction_p <- direction_mdl_df |> 
+#   ggplot(aes(x = year, y = estimate__,
+#              ymin = lower__, ymax = upper__)) +
+#   geom_ribbon(fill = 'grey', alpha = 0.7) +
+#   geom_line(col = 'purple', size = 1.25)
+# 
+# # Axes and labels:
+# 
+# direction_p <- direction_p +
+#   scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+#   scale_y_continuous(limits = c(0, 1),
+#                      expand = c(0, 0)) +
+#   xlab('Year') +
+#   ylab('Probability of vertical writing')
+# 
+# # Show and save:
+# 
+# direction_p
+# ggsave('../figures/pdf/writing_direction.pdf', direction_p,
+#        width = 5.8, height = 3.7)
+# ggsave('../figures/png/writing_direction.png', direction_p,
+#        width = 5.8, height = 3.7)
+```
+
+
+## Ideophones and sound objects
+
+### Ideophones
+
+What is the breakdown of counts, like, how many ads have 1, 2, or 3 ideophones etc.?
+
+```{r}
+soju |> 
+  adorn_percentages(ideophone_word_count) |> 
+  print(n = Inf)
+```
+
+`NA`'s indicate ads without ideophones.
+
+Easier to just look at the binary variable:
+
+```{r}
+soju |> 
+  adorn_percentages(ideophone_red)
+```
+
+As elswehere, we'll use the `yes/no` variable for looking at time trends.
+
+What are the ideophones? Collapse categories that only differ in punctuation for this, but we need to be careful that one cell contains '지끈지끈, 울렁울렁', which we'll want to have on separate lines.
+
+```{r}
+ideophone_tab <- soju |> 
+  mutate(ideophone_clean = str_replace_all(ideophone,
+                                           '[^가-힣]',
+                                           '')) |>
+  count(ideophone_clean) |> 
+  filter(!is.na(ideophone_clean)) |> 
+  mutate(ideophone_clean = if_else(ideophone_clean == '지끈지끈울렁울렁',
+                             '지끈지끈', ideophone_clean)) |>   
+  bind_rows(tibble(ideophone_clean = '울렁울렁',
+            n = 1)) |> 
+  arrange(desc(n)) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         p = p * 100,
+         p = str_c(p, '%'))
+
+# Show and save:
+
+ideophone_tab
+write_excel_csv(ideophone_tab, '../summary_tables/ideophone_table.csv')
+```
+
+Look at the time trend for the reduced variable `hanja_red` (Yes/No) as a proportion and a stacked bar plot:
+
+```{r}
+# Plot core:
+
+ideophone_bar_p <- soju |>
+  count(year_binned, ideophone_red) |>
+  group_by(year_binned) |>
+  mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = year_binned, y = prop, fill = ideophone_red)) +
+  geom_col(col = 'black')
+
+# Axes and labels:
+
+ideophone_bar_p <- ideophone_bar_p +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Show:
+
+ideophone_bar_p
+```
+
+For reporting, here is proportion of ads with ideophones counted by decade (`year_binned`):
+
+```{r}
+soju |> 
+  count(year_binned, ideophone_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%')) |> 
+  filter(ideophone_red != 'no')
+```
+
+Build a model of `p(y = has ideophone)`, which will be a logistic regression model:
+
+**Bodo action point**: Need to recompile with even higher `adapt_delta` and possibly better priors to get rid of divergent transitions.
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               ideophone_red = factor(ideophone_red, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+ideophone_mdl <- brm(bf(ideophone_red ~ 1 +
+                        s(year) +
+                        (1|company)),
+                 data = soju,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(ideophone_mdl, file = '../models/ideophone_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/ideophone_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(ideophone_mdl, ndraws = 100)
+pp_check(ideophone_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+ideophone_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+ideophone_mdl_df <- conditional_effects(ideophone_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+ideophone_p <- ideophone_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+ideophone_p <- ideophone_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 0.35),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Proportion of ideophones')
+
+# Show and save:
+
+ideophone_p
+ggsave('../figures/pdf/ideophone.pdf', ideophone_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/ideophone.png', ideophone_p,
+       width = 5.8, height = 3.7)
+```
+
+### Sound objects
+
+What is the breakdown of counts, like, how many ads have 1, 2, or 3 sound objects etc.?
+
+```{r}
+soju |> 
+  adorn_percentages(sound_object_word_count) |> 
+  print(n = Inf)
+```
+
+`NA`'s indicate ads without sound objects.
+
+Easier to just look at the binary variable:
+
+```{r}
+soju |> 
+  adorn_percentages(sound_object_red)
+```
+
+As elswehere, we'll use the `yes/no` variable for looking at time trends.
+
+What are the sound objects? We need to make sure that 'ㅇㅋ~, 앗싸~' and '야야야, 차차차' are on separate rows:
+
+```{r}
+sound_object_tab <- soju |> 
+  mutate(sound_object = if_else(sound_object == 'ㅇㅋ~, 앗싸~',
+                                '앗싸~', sound_object),
+         sound_object = if_else(sound_object == '야야야, 차차차',
+                                '차차차', sound_object)) |> 
+  count(sound_object) |> 
+  bind_rows(tibble(sound_object = c('ㅇㅋ~', '야야야'),
+                   n = c(1, 1))) |> 
+  filter(!is.na(sound_object)) |>
+  arrange(desc(n),
+          desc(sound_object))|> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         p = p * 100,
+         p = str_c(p, '%'))
+
+# Show and save:
+
+sound_object_tab
+write_excel_csv(sound_object_tab, '../summary_tables/sound_object_table.csv')
+```
+
+
+Look at the time trend for the reduced variable `hanja_red` (Yes/No) as a proportion and a stacked bar plot:
+
+```{r}
+# Plot core:
+
+sound_object_bar_p <- soju |>
+  count(year_binned, sound_object_red) |>
+  group_by(year_binned) |>
+  mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = year_binned, y = prop, fill = sound_object_red)) +
+  geom_col(col = 'black')
+
+# Axes and labels:
+
+sound_object_bar_p <- sound_object_bar_p +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Show:
+
+sound_object_bar_p
+```
+
+For reporting, here is proportion of ads with ideophones counted by decade (`year_binned`):
+
+```{r}
+soju |> 
+  count(year_binned, sound_object_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%')) |> 
+  filter(sound_object_red != 'no')
+```
+
+Build a model of `p(y = has sound object)`, which will be a logistic regression model:
+
+**Bodo action point**: Need to recompile with even higher `adapt_delta` and possibly better priors to get rid of divergent transitions.
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               sound_object_red = factor(sound_object_red, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+sound_object_mdl <- brm(bf(sound_object_red ~ 1 +
+                        s(year) +
+                        (1|company)),
+                 data = soju,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(sound_object_mdl, file = '../models/sound_object_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/sound_object_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(sound_object_mdl, ndraws = 100)
+pp_check(sound_object_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+sound_object_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+sound_object_mdl_df <- conditional_effects(sound_object_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+sound_object_p <- sound_object_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+sound_object_p <- sound_object_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 0.35),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Proportion of sound objects')
+
+# Show and save:
+
+sound_object_p
+ggsave('../figures/pdf/sound_object.pdf', ideophone_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/sound_object.png', ideophone_p,
+       width = 5.8, height = 3.7)
+```
+
+### Ideophones and sound objects together
+
+What is the connection between ideophones and sound objects?
+
+```{r}
+soju |> 
+  adorn_percentages(ideophone_red, sound_object_red)
+```
+
+Ideophones and sound objects never occur in the same ad together. Makes sense, for one because they're both infrequent, so the baseline chance of this happening is low, but also because they probably fulfill similar function and are thus in complementary distribution.
+
+### Double plot
+
+```{r}
+# Change titles:
+
+ideophone_p <- ideophone_p + ggtitle('a) Ideophones')
+sound_object_p <- sound_object_p + ggtitle('b) Sound objects')
+
+# Change y-axes:
+
+ideophone_p <- ideophone_p + ylab('Probability') +
+  theme(plot.title = element_text(face = 'bold'))
+sound_object_p <- sound_object_p + ylab(NULL) +
+  theme(axis.text.y = element_blank(),
+        plot.title = element_text(face = 'bold'))
+
+# Merge:
+
+double_p <- ideophone_p + sound_object_p
+
+# Show and save:
+
+double_p
+ggsave(plot = double_p, filename = '../figures/pdf/ideophone_sound_object.pdf',
+       width = 9.5, height = 3.5)
+ggsave(plot = double_p, filename = '../figures/png/ideophone_sound_object.png',
+       width = 9.5, height = 3.5)
+```
+
+
+## Politeness indexicals
+
+### Slogan ending
+
+Check the slogan endings:
+
+```{r}
+soju |> 
+  filter(!is.na(main_slogan_ending_red)) |> 
+  adorn_percentages(main_slogan_ending_red)
+```
+
+Let's check this over binned time:
+
+```{r}
+soju |> 
+  mutate(year_binned = factor(year_binned)) |> 
+  count(year_binned, main_slogan_ending_red) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = main_slogan_ending_red)) +
+  geom_col(col = 'black') +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')
+```
+
+There's a rise and fall of verbs over time. And nonverbal speech sounds are unattested for the earlier years. Let's compute the descriptive percentages:
+
+```{r}
+soju |> 
+  count(year_binned, main_slogan_ending_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%')) |> 
+  filter(main_slogan_ending_red == 'Noun')
+```
+
+Build a model of verb ending, `p(y = has noun)`, where `'Verb'` is the reference level:
+
+```{r eval = FALSE}
+# Create a subset of only those that have nouns or verbs and then factor code this, setting verb as reference level:
+
+soju_ending_red <- soju |> 
+  filter(main_slogan_ending_red %in% c('Verb', 'Noun')) |> 
+  mutate(main_slogan_ending_red = factor(main_slogan_ending_red,
+                                         levels = c('Verb', 'Noun')))
+
+# Generalized additive logistic regression model (with time splines):
+
+slogan_end_mdl <- brm(bf(main_slogan_ending_red ~ 1 +
+                         s(year) +
+                         (1|company)),
+                 data = soju_ending_red,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(slogan_end_mdl, file = '../models/slogan_end_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/slogan_end_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(slogan_end_mdl, ndraws = 100)
+pp_check(slogan_end_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+slogan_end_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+slogan_end_mdl_df <- conditional_effects(slogan_end_mdl)$year
+```
+
+Make a plot of the curve, first noun endings:
+
+```{r}
+# Plot core:
+
+slogan_end_p <- slogan_end_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+slogan_end_p <- slogan_end_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of ending in a noun')
+
+# Show and save:
+
+slogan_end_p
+ggsave('../figures/png/slogan_end.png', slogan_end_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/pdf/slogan_end.pdf', slogan_end_p,
+       width = 5.8, height = 3.7)
+```
+
+### Secondary slogan ending
+
+Let's do the same for `secondary_slogan_ending`:
+
+```{r}
+soju |> 
+  count(secondary_slogan_ending, sort = TRUE)
+```
+
+Rinse and repeat:
+
+```{r}
+soju |> 
+  filter(!is.na(secondary_slogan_ending_red)) |>
+  count(year_binned, secondary_slogan_ending_red) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = secondary_slogan_ending_red)) +
+  geom_col(col = 'black') +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+I'm not going to look at `noun_token` and `verb_token` and `english_token` in detail as that would be way too many categories.
+
+### Slogan politeness
+
+```{r}
+soju |> 
+  filter(!is.na(verb_token)) |> 
+  adorn_percentages(verb_token)
+```
+
+Let's look at `slogan_end_verb`:
+
+```{r}
+slogan_verb_counts <- soju |> 
+  filter(!is.na(slogan_end_verb_red)) |> 
+  adorn_percentages(slogan_end_verb_red)
+
+# Show:
+
+slogan_verb_counts
+```
+
+Plot this over time for the three most frequent cases, for which we should first get the Korean out of that count table for the first four rows, and then exclude the `NA`:
+
+```{r}
+keep_these <- soju |> 
+  adorn_percentages(slogan_end_verb) |> 
+  slice_head(n = 4) |> 
+  filter(!is.na(slogan_end_verb)) |> 
+  pull(slogan_end_verb)
+
+# Show:
+
+keep_these
+```
+
+Make a plot of this:
+
+```{r}
+soju |> 
+  filter(slogan_end_verb %in% keep_these) |>
+  count(year_binned, slogan_end_verb) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n),
+         slogan_end_verb = factor(slogan_end_verb, levels = keep_these)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = slogan_end_verb)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('steelblue', 'goldenrod3', 'purple'),
+                    name = FALSE) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The Korean text doesn't print properly, but the purple one that declines over time is the -nida form (less politeness over time in ads?), the blue one that rises massively is panmal, then -yo is in the middle, kinda constant.
+
+Especially if we treat "-yo" as also being more polite, in contrast to panmal, then this would be a relatively clear trend towards more panmal / informal speech in the last two decades.
+
+Let's make a plot of just the reduced `contaymal` versus `panmal` variable `slogan_end_verb_red`:
+
+```{r}
+soju |> 
+  count(year_binned, slogan_end_verb_red) |> 
+  filter(!is.na(slogan_end_verb_red)) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = slogan_end_verb_red)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('steelblue', 'goldenrod3'),
+                    name = FALSE) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Clear rise of `panmal` (informal style) over time. What are the descriptive percentages for that?
+
+```{r}
+soju |> 
+  count(year_binned, slogan_end_verb_red) |> 
+  filter(!is.na(slogan_end_verb_red)) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         p = round(p, 2),
+         percentage = str_c(p * 100, '%'))
+```
+
+Make a model of this, modeling `p(y = has panmal)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired order of levels:
+
+soju <- mutate(soju,
+               slogan_end_verb_red = factor(slogan_end_verb_red,
+                                            levels = c('contaymal', 'panmal')))
+
+# Generalized additive logistic regression model (with time splines):
+
+panmal_mdl <- brm(bf(slogan_end_verb_red ~ 1 +
+                       s(year) +
+                       (1|company)),
+                 data = filter(soju, !is.na(slogan_end_verb_red)),
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(panmal_mdl, file = '../models/panmal_mdl.RData')
+```
+
+**Bodo action point**: 4 divergent transitions to kill.
+
+Load:
+
+```{r}
+load('../models/panmal_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(panmal_mdl, ndraws = 100)
+pp_check(panmal_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+panmal_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+panmal_mdl_df <- conditional_effects(panmal_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+panmal_p <- panmal_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+panmal_p <- panmal_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of panmal')
+
+# Show and save:
+
+panmal_p
+ggsave('../figures/pdf/panmal.pdf', panmal_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/panmal.png', panmal_p,
+       width = 5.8, height = 3.7)
+```
+
+### Sound objects
+
+Check:
+
+```{r}
+soju |> 
+  adorn_percentages(main_slogan_ending)
+```
+
+Check when all ads were published that featured nonverbal speech sounds:
+
+```{r}
+soju |> 
+  filter(main_slogan_ending == 'Nonverbal speech sound') |> 
+  select(year) |> 
+  adorn_percentages(year) |> 
+  arrange(year)
+```
+
+Check the tokens:
+
+```{r}
+soju |> 
+  filter(!is.na(slogan_end_nonverbal)) |> 
+  adorn_percentages(slogan_end_nonverbal)
+```
+
+## Bottle features
+
+### Bottle presence
+
+Let's look at the `bottle_presence` variable:
+
+```{r}
+soju |> 
+  adorn_percentages(bottle_presence)
+```
+
+Plot this over time:
+
+```{r}
+soju |> 
+  count(year_binned, bottle_presence) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = bottle_presence)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Clearly more superimposed type later... would make sense though since this probably scales with image editing technology in terms of software, which has become better over time, making this easier to do for advertising and marketing firms.
+
+Check the simplified variable:
+
+```{r}
+soju |> 
+  adorn_percentages(has_bottle)
+```
+
+The 16 ads without a bottle, from when are they?
+
+```{r}
+soju |>
+  filter(has_bottle == 'no') |>
+  select(id, company, brand, year)
+```
+
+Count the decades for this:
+
+```{r}
+soju |>
+  filter(has_bottle == 'no') |>
+  count(year_binned)
+```
+
+Quantify decade:
+
+```{r}
+soju |> 
+  count(year_binned, has_bottle) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         percentage = round(p, 2) * 100,
+         percentage = str_c(percentage, '%'))
+```
+
+For reporting, report differences for those where the bottle is present:
+
+```{r}
+soju |> 
+  filter(has_bottle == 'yes') |> 
+  adorn_percentages(bottle_presence)
+```
+
+
+Make a model of bottle presence over time, using `has_bottle`.
+
+Build a model of `p(y = has bottle)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               has_bottle = factor(has_bottle, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+bottle_presence_mdl <- brm(bf(has_bottle ~ 1 +
+                                s(year) +
+                                (1|company)),
+                           data = soju,
+                           family = bernoulli,
+                 
+                           # MCMC settings:
+                   
+                           cores = 4, seed = 42,
+                           chains = 4, iter = 6000, warmup = 4000,
+                           control = list(adapt_delta = 0.99,
+                                          max_treedepth = 12))
+
+# Save model:
+
+save(bottle_presence_mdl, file = '../models/bottle_presence_mdl.RData')
+```
+
+**Bodo action point**: 16 divergent transitions (!!) need to be eliminated.
+
+Load:
+
+```{r}
+load('../models/bottle_presence_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(bottle_presence_mdl, ndraws = 100)
+pp_check(bottle_presence_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+bottle_presence_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+bottle_presence_mdl_df <- conditional_effects(bottle_presence_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+bottle_presence_p <- bottle_presence_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+bottle_presence_p <- bottle_presence_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of bottle in ad')
+
+# Show and save:
+
+bottle_presence_p
+ggsave('../figures/pdf/bottle_presence.pdf', bottle_presence_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/bottle_presence.png', bottle_presence_p,
+       width = 5.8, height = 3.7)
+```
+
+### Bottle position
+
+Another noteworthy pattern is that there's more ads without any bottle in the past. So, over time, people have emphasized the bottle more! Certainly here there is less of a trivial technological explanation for that, in that people for sure could've made photos of the bottle in the past. So this probably reflects a more strategic decision.
+
+```{r}
+soju |> 
+  adorn_percentages(bottle_position)
+```
+
+Some cleaning to do here, including typos. Let's simplify the centre stuff and at the same time get rid of the typo:
+
+```{r}
+soju <- mutate(soju,
+               bottle_position = str_replace_all(bottle_position,
+                                                 '(entre)|(etnre)',
+                                                 'enter'))
+```
+
+Ok, some issues here. The `bottle_presence` variable has `== Yes` for one case that then has no bottle position. How can a bottle be present that has no position?
+
+The `bottle_position` variable is different from the `logo_location` variable, in that the bottle can of course be larger or smaller, and then be positioned differently — it's not as easily locatable into horizontal and vertical quadrants. For that reason, we will just look at the most common categories again, but leaving these categories unchanged for now, to see whether there are any noteworthy trends over time.
+
+```{r}
+# Vector of first six from table of counts:
+
+bottle_positions <- soju |> 
+  count(bottle_position, sort = TRUE) |> 
+  slice_head(n = 6) |> 
+  pull(bottle_position)
+
+# Plot:
+
+soju |> 
+  filter(bottle_position %in% bottle_positions) |> 
+  mutate(bottle_position = factor(bottle_position, levels = bottle_positions)) |> 
+  count(year_binned, bottle_position) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = bottle_position)) +
+  geom_col(col = 'black') +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The bottle has surely moved more towards the bottom and more towards the right. It's definitely in less central positions as before. This goes against my idea that the bottle has risen in importance over time. It suggests more that *if* the bottle was present in the past, it was also in a more central position.
+
+We may want to think about what this means in terms of scanning directions for images, and whether given what we know about this, people will notice the bottle first or last. Perhaps there's some literature on scanning direction in images or even specifically ads (eye-tracking studies?), and then also literature on placement of stuff inside ads?
+
+### Bottle color
+
+Bottle color is next:
+
+```{r}
+soju |> 
+  filter(!is.na(bottle_color)) |> 
+  adorn_percentages(bottle_color)
+```
+
+Then finally, isn't `and clear` a separate piece of information? I suspect that some of the bottles coded as `Green` are also sometimes clear? (Can we check?) Either way, it would be good if this variable is *only* hue, and not a mix of hue and transparency, which are two separate variables.
+
+Let's look at temporal trends:
+
+```{r}
+soju |> 
+  count(year_binned, bottle_color) |> 
+  filter(!is.na(bottle_color),
+         bottle_color != 'Cannot tell') |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = bottle_color)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('blue', 'brown', 'lightblue',
+                               'green', 'white'),
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL)
+```
+
+A definite shift towards green, and no more black or browns in later years, as well as fewer clears.
+
+Let's get some nice numbers to report on these trends:
+
+```{r}
+soju |> 
+  filter(bottle_color %in% c('Brown or black', 'Green', 'Clear')) |> 
+  count(year_binned, bottle_color) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         percentage = round(p, 2) * 100,
+         percentage = str_c(percentage, '%'))
+```
+
+
+Make a model of this, green bottles over time, modeling `p(y = has green bottle)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               has_green_bottle = factor(has_green_bottle, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+green_bottle_mdl <- brm(bf(has_green_bottle ~ 1 +
+                             s(year) +
+                             (1|company)),
+                        data = filter(soju, bottle_presence != 'No',
+                                      overall_color == 'Color'),
+                        family = bernoulli,
+                 
+                        # MCMC settings:
+                   
+                        cores = 4, seed = 42,
+                        chains = 4, iter = 6000, warmup = 4000,
+                        control = list(adapt_delta = 0.99,
+                                       max_treedepth = 12))
+
+# Save model:
+
+save(green_bottle_mdl, file = '../models/green_bottle_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/green_bottle_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(green_bottle_mdl, ndraws = 100)
+pp_check(green_bottle_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+green_bottle_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+green_bottle_mdl_df <- conditional_effects(green_bottle_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+green_bottle_p <- green_bottle_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+green_bottle_p <- green_bottle_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of green bottle')
+
+# Show and save:
+
+green_bottle_p
+ggsave('../figures/pdf/green_bottle.pdf', green_bottle_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/green_bottle.png', green_bottle_p,
+       width = 5.8, height = 3.7)
+```
+
+Next, clear bottles over time, modeling `p(y = has clear bottle)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               has_clear_bottle = factor(has_clear_bottle, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+clear_bottle_mdl <- brm(bf(has_clear_bottle ~ 1 +
+                             s(year) +
+                             (1|company)),
+                        data = filter(soju, bottle_presence != 'No',
+                                      overall_color == 'Color'),
+                        family = bernoulli,
+                 
+                        # MCMC settings:
+                   
+                        cores = 4, seed = 42,
+                        chains = 4, iter = 6000, warmup = 4000,
+                        control = list(adapt_delta = 0.99,
+                                       max_treedepth = 12))
+
+# Save model:
+
+save(clear_bottle_mdl, file = '../models/clear_bottle_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/clear_bottle_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(clear_bottle_mdl, ndraws = 100)
+pp_check(clear_bottle_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+clear_bottle_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+clear_bottle_mdl_df <- conditional_effects(clear_bottle_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+clear_bottle_p <- clear_bottle_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+clear_bottle_p <- clear_bottle_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of clear bottle')
+
+# Show and save:
+
+clear_bottle_p
+ggsave('../figures/pdf/clear_bottle.pdf', clear_bottle_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/clear_bottle.png', clear_bottle_p,
+       width = 5.8, height = 3.7)
+```
+
+Same for has brown or black bottle variable `has_black_or_brown_bottle`, modeling `p(y = has brown or black bottle)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               has_black_or_brown_bottle = factor(has_black_or_brown_bottle,
+                                                  levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+brown_bottle_mdl <- brm(bf(has_black_or_brown_bottle ~ 1 +
+                             s(year) +
+                             (1|company)),
+                        data = filter(soju, bottle_presence != 'No',
+                                      overall_color == 'Color'),
+                        family = bernoulli,
+                 
+                        # MCMC settings:
+                   
+                        cores = 4, seed = 42,
+                        chains = 4, iter = 6000, warmup = 4000,
+                        control = list(adapt_delta = 0.99,
+                                       max_treedepth = 12))
+
+# Save model:
+
+save(brown_bottle_mdl, file = '../models/brown_bottle_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/brown_bottle_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(brown_bottle_mdl, ndraws = 100)
+pp_check(brown_bottle_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+brown_bottle_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+brown_bottle_mdl_df <- conditional_effects(brown_bottle_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+brown_bottle_p <- brown_bottle_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+brown_bottle_p <- brown_bottle_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of black or brown bottle')
+
+# Show and save:
+
+brown_bottle_p
+ggsave('../figures/pdf/black_or_brown_bottle.pdf', brown_bottle_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/black_or_brown_bottle.png', brown_bottle_p,
+       width = 5.8, height = 3.7)
+```
+
+Make a triple plot of the three main color categories:
+
+```{r}
+# Change titles:
+
+green_bottle_p <- green_bottle_p + ggtitle('a) Green bottles')
+clear_bottle_p <- clear_bottle_p + ggtitle('b) Clear bottles')
+brown_bottle_p <- brown_bottle_p + ggtitle('c) Black or brown bottles')
+
+# Change y-axes:
+
+green_bottle_p <- green_bottle_p + ylab('Probability') +
+  theme(plot.title = element_text(face = 'bold'))
+clear_bottle_p <- clear_bottle_p + ylab(NULL) +
+  theme(axis.text.y = element_blank(),
+        plot.title = element_text(face = 'bold'))
+brown_bottle_p <- brown_bottle_p + ylab(NULL) +
+  theme(axis.text.y = element_blank(),
+        plot.title = element_text(face = 'bold'))
+
+# Merge:
+
+triple_p <- green_bottle_p + clear_bottle_p + brown_bottle_p
+
+# Show and save:
+
+triple_p
+ggsave(plot = triple_p, filename = '../figures/pdfbottle_color_triple.pdf',
+       width = 15, height = 4.5)
+```
+
+## Bottle shape
+
+What about bottle shape?
+
+```{r}
+soju |> 
+  count(bottle_shape, sort = TRUE) |> 
+  print(n = Inf)
+```
+
+Let's look at the most dominant categories then:
+
+```{r}
+# Extract vector:
+
+these_shapes <- soju |> 
+  filter(!is.na(bottle_shape)) |> 
+  count(bottle_shape, sort = TRUE) |> 
+  slice_head(n = 6) |> 
+  pull(bottle_shape)
+
+# Plot basics:
+
+shape_p <- soju |> 
+  filter(bottle_shape %in% these_shapes) |> 
+  count(year_binned, bottle_shape) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = bottle_shape)) +
+  geom_col(col = 'black',
+           width = 6)
+
+# Scales, axes and cosmetics:
+
+shape_p <- shape_p +
+  scale_x_continuous(breaks = seq(1960, 2020, by = 10),
+                     labels = seq(1960, 2020, by = 10)) +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL,
+                    direction = -1) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.x = element_text(face = 'bold', size = 12),
+        legend.position = 'bottom')
+
+# Show and save:
+
+shape_p
+ggsave(plot = shape_p, filename = '../figures/pdf/bottle_shape_barplot.pdf',
+       width = 7.5, height = 5.5)
+ggsave(plot = shape_p, filename = '../figures/png/bottle_shape_barplot.png',
+       width = 7.5, height = 5.5)
+```
+
+Very clear pattern where the long neck ones win over time, and the short neck ones clearly die out. The reduced `bottle_shape_red` variable may be a better indicator here:
+
+```{r}
+soju |> 
+  filter(!is.na(bottle_shape_red)) |> 
+  adorn_percentages(bottle_shape_red)
+```
+
+Overall more long necked ones. Let's look at this over time:
+
+```{r}
+soju |> 
+  filter(!is.na(bottle_shape_red)) |> 
+  count(year_binned, bottle_shape_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         percentage = round(p, 2) * 100,
+         percentage = str_c(percentage, '%'))
+```
+
+Make a model of this, modeling long over short necks:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               bottle_shape_red = factor(bottle_shape_red,
+                                         levels = c('short neck', 'long neck')))
+
+# Generalized additive logistic regression model (with time splines):
+
+shape_mdl <- brm(bf(bottle_shape_red ~ 1 +
+                      s(year) +
+                      (1|company)),
+                 data = filter(soju, !is.na(bottle_shape_red)),
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(shape_mdl, file = '../models/shape_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/shape_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(shape_mdl, ndraws = 100)
+pp_check(shape_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+shape_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+shape_mdl_df <- conditional_effects(shape_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+shape_p <- shape_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+shape_p <- shape_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of long neck')
+
+# Show and save:
+
+shape_p
+ggsave('../figures/pdf/shape.pdf', shape_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/shape.png', shape_p,
+       width = 5.8, height = 3.7)
+```
+
+## Bottle size
+
+Let's check `bottle_size`:
+
+```{r}
+soju |> 
+  count(bottle_size, sort = TRUE)
+```
+
+Check the `NA` cases again in relation to `bottle_presence`:
+
+```{r}
+soju |> 
+  count(bottle_presence, bottle_size)
+```
+
+Ok, what are these?
+
+```{r}
+soju |> 
+  filter(bottle_presence != 'No',
+         is.na(bottle_size)) |> 
+  select(id, year, company, brand, bottle_presence, bottle_size)
+```
+
+**Action point 23:** Check these cases, where the bottle is indicated to be present on `bottle_presence` but doesn't have a size.
+
+## Bottle continuous data analysis
+
+Yet to be done...
+
+```{r}
+soju |> 
+  ggplot(aes(x = year, y = neck_ratio)) +
+  geom_point()
+
+soju |> 
+  ggplot(aes(x = year, y = body_ratio)) +
+  geom_point()
+
+soju |> 
+  ggplot(aes(x = year, y = neck_over_body_ratio)) +
+  geom_point()
+```
+
+These are all super similar. Let's plot them against `alcohol_content` instead of time.
+
+```{r}
+soju |> 
+  ggplot(aes(x = alcohol_content, y = neck_ratio)) +
+  geom_point()
+
+soju |> 
+  ggplot(aes(x = alcohol_content, y = neck_ratio)) +
+  geom_point()
+```
+
+
+## Logo location
+
+Show logo location counts:
+
+```{r}
+logo_location_counts <- soju |> 
+  adorn_percentages(logo_location) |> 
+  print()
+```
+
+What's the average year for each? This way we can see whether there's a temporal trend for logo location.
+
+```{r}
+soju |> 
+  group_by(logo_location) |> 
+  summarize(year = mean(year, na.rm = TRUE)) |> 
+  right_join(logo_location_counts) |> 
+  arrange(desc(n))
+```
+
+Check that this works:
+
+```{r}
+soju |> 
+  filter(!is.na(logo_vertical)) |> 
+  adorn_percentages(logo_vertical)
+
+soju |> 
+  filter(!is.na(logo_horizontal)) |> 
+  adorn_percentages(logo_horizontal)
+```
+
+Compute average year for these to get a first-hand feel for temporal shifts:
+
+```{r}
+soju |> 
+  group_by(logo_vertical) |> 
+  summarize(M = mean(year))
+
+soju |> 
+  group_by(logo_horizontal) |> 
+  summarize(M = mean(year))
+```
+
+Check for temporal trends then. First for `logo_vertical`:
+
+```{r}
+soju |> 
+  count(year_binned, logo_vertical) |>
+  filter(!is.na(logo_vertical)) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ungroup() |> 
+  ggplot(aes(x = year_binned, y = prop, group = logo_vertical)) +
+  geom_line(aes(color = logo_vertical)) +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_y_continuous(limits = c(0, 1))
+```
+
+Quite a fluctuation, but the logo seems to have moved from more bottom position to more top position.
+
+The goal was to model this using a multinomial model, but the problem is that the center position is not attested beyond 1990, which messes up our ability to make any inferences for that (it's also quite low in number anyway). So we'll resort to modeling just the difference between `top` and `center` position.
+
+```{r eval = FALSE}
+logo_vertical_mdl <- brm(bf(logo_vertical ~ 1 +
+                              s(year) +
+                              (1|company)),
+                         data = filter(soju, logo_vertical != 'center') |> 
+                           mutate(logo_vertical = factor(logo_vertical)),
+                         family = bernoulli,
+                         
+                         # MCMC settings:
+                   
+                         cores = 4, seed = 42,
+                         control = list(adapt_delta = 0.96),
+                         chains = 4, iter = 4000, warmup = 3000)
+
+# Save model:
+
+save(logo_vertical_mdl, file = '../models/logo_vertical_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/logo_vertical_mdl.RData')
+```
+
+Show conditional effects of `logo_vertical_mdl`:
+
+```{r}
+conditional_effects(logo_vertical_mdl)
+```
+
+Let's do the same for `logo_horizontal`:
+
+```{r}
+soju |> 
+  count(year_binned, logo_horizontal) |>
+  filter(!is.na(logo_horizontal)) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ungroup() |> 
+  ggplot(aes(x = year_binned, y = prop, group = logo_horizontal)) +
+  geom_line(aes(color = logo_horizontal)) +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_y_continuous(limits = c(0, 1))
+```
+
+Definitely a clear trend where the logo has moved from center position towards a more left position in the majority of cases.
+
+Let's model this using a multinomial model:
+
+```{r eval = FALSE}
+logo_horizontal_mdl <- brm(bf(logo_horizontal ~ 1 +
+                                s(year) +
+                                (1|company)),
+                           data = mutate(soju,
+                                         logo_horizontal = factor(logo_horizontal)),
+                           family = multinomial,
+                           
+                           # MCMC settings:
+                   
+                           cores = 4, seed = 42,
+                           control = list(adapt_delta = 0.96),
+                           chains = 4, iter = 4000, warmup = 3000)
+
+# Save model:
+
+save(logo_horizontal_mdl, file = '../models/logo_horizontal_mdl.RData')
+```
+
+Load:
+
+```{r}
+# load('../models/logo_horizontal_mdl.RData')
+```
+
+**Bodo action point:** Model does not even start — is this because of the regression splines, and that for each time point something needs to be attested?
+
+## Logo modality and type
+
+Check `logo_modality`:
+
+```{r}
+soju |> 
+  filter(!is.na(logo_modality)) |> 
+  adorn_percentages(logo_modality)
+```
+
+Check `multimodal_logo_type`:
+
+```{r}
+soju |>
+  filter(!is.na(multimodal_logo_type)) |> 
+  adorn_percentages(multimodal_logo_type)
+```
+
+## Font color
+
+Next, let's look at the `writing_color` variable, but for only those that are not complete black and white. We need to extract `NA`s which are the two ads for which there is no writing (`id == 535` and `id == 539`).
+
+```{r}
+soju |> 
+  filter(overall_color == 'Color',
+         !is.na(writing_color)) |> 
+  adorn_percentages(writing_color) |> 
+  print(n = Inf)
+```
+
+What's with the `NA`s here? What are they?
+
+```{r}
+soju |> 
+  filter(is.na(writing_color)) |> 
+  select(id, company, brand, writing_color)
+```
+
+Let's look at the first 6, which is all the way up to green, across years. We also want to have control over the order of factor levels so that we can display things in a sensible order. So we'll create a vector with the desired ordered first, and then use that to convert the character vector `writing_color` into a factor vector, but only for the plot (not saved in the tibble).
+
+```{r}
+# Define vector with pre-specified order of levels:
+
+color_levels <- c('Black', 'White', 'Blue', 'Green',
+                  'Green and black', 'Blue and white')
+
+# Plot with these levels:
+
+soju |> 
+  filter(overall_color == 'Color',
+         writing_color %in% c('White', 'Black', 'Blue',
+                              'Green and black', 'Blue and white',
+                              'Green')) |> 
+  mutate(writing_color = factor(writing_color, levels = color_levels)) |> 
+  count(year_binned, writing_color) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = writing_color)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('black', 'white', 'blue',
+                               'green', 'darkgreen', 'lightblue'),
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL)
+```
+
+It looks like there's more blue in later years. Also more white in after 2005 than before, and certainly less black. More light blue for sure, but green seems fairly stable in comparison. The only green fronts seem to be a post-1995 invention though.
+
+Another way of looking at this is to use the `any_green` variables created above that also captures the fonts that have some mix with green, and the same for `any_blue`. 
+
+```{r}
+# Check:
+
+soju |>
+  count(any_green)
+
+soju |>
+  count(any_blue)
+
+# Sanity check a few instances:
+
+soju |> filter(any_green == 'has green') |> 
+  sample_n(10) |> select(writing_color)
+
+soju |> filter(any_blue == 'has blue') |> 
+  sample_n(10) |> select(writing_color)
+```
+
+Ok, seems to have worked out. Let's plot this now over time:
+
+```{r}
+soju |> 
+  filter(!is.na(any_green),
+         overall_color == 'Color') |> 
+  count(year_binned, any_green) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = any_green)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('darkgreen', 'darkgrey'),
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL)
+```
+
+Green onset in the 80's, but then it got a bit trite?
+
+Let's look at `any_blue` in comparison:
+
+```{r}
+soju |> 
+  filter(!is.na(any_blue),
+         overall_color == 'Color') |> 
+  count(year_binned, any_blue) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = any_blue)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('blue', 'darkgrey'),
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL)
+```
+
+Oh wow, that's a bit unexpected IMO. More blue for the pre-1985 ones? Obviously these are very few in number because there's less color ads for those years, so to be taken with a grain of salt, but let's check these cases perhaps?
+
+```{r}
+soju |> 
+  filter(year <= 1985,
+         overall_color == 'Color',
+         any_blue == 'has blue') |> 
+  select(id, year, company, brand)
+```
+
+Check those cases perhaps? What is blue used for here? And, so, yeah, there's actually an overall trend of more blue since 1995, since those are much bigger numbers.
+
+Build a model of `p(y = has green font)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               any_green = factor(any_green, levels = c('no green', 'has green')))
+
+# Generalized additive logistic regression model (with time splines):
+
+font_green_mdl <- brm(bf(any_green ~ 1 +
+                        s(year) +
+                        (1|company)),
+                 data = filter(soju, overall_color == 'Color'),
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(font_green_mdl, file = '../models/font_green_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/font_green_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(font_green_mdl, ndraws = 100)
+pp_check(font_green_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+font_green_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+font_green_mdl_df <- conditional_effects(font_green_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+font_green_p <- font_green_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+font_green_p <- font_green_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of green font')
+
+# Show and save:
+
+font_green_p
+ggsave('../figures/pdf/font_green.pdf', font_green_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/font_green.png', font_green_p,
+       width = 5.8, height = 3.7)
+```
+
+Build a model of `p(y = has blue font)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               any_blue = factor(any_blue, levels = c('no blue', 'has blue')))
+
+# Generalized additive logistic regression model (with time splines):
+
+font_blue_mdl <- brm(bf(any_blue ~ 1 +
+                        s(year) +
+                        (1|company)),
+                 data = filter(soju, overall_color == 'Color'),
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(font_blue_mdl, file = '../models/font_blue_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/font_blue_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(font_blue_mdl, ndraws = 100)
+pp_check(font_blue_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+font_blue_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+font_blue_mdl_df <- conditional_effects(font_blue_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+font_blue_p <- font_blue_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+font_blue_p <- font_blue_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of blue font')
+
+# Show and save:
+
+font_blue_p
+ggsave('../figures/pdf/font_blue.pdf', font_blue_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/font_blue.png', font_blue_p,
+       width = 5.8, height = 3.7)
+```
+
+Put both together into a double plot:
+
+```{r}
+
+# Change titles:
+
+font_green_p <- font_green_p + ggtitle('a) Green font')
+font_blue_p <- font_blue_p + ggtitle('b) Blue font')
+
+# Change y-axes:
+
+font_green_p <- font_green_p + ylab('Probability') +
+  theme(plot.title = element_text(face = 'bold'))
+font_blue_p <- font_blue_p + ylab(NULL) +
+  theme(axis.text.y = element_blank(),
+        plot.title = element_text(face = 'bold'))
+
+# Merge:
+
+font_colors_p <- font_green_p + font_blue_p
+
+# Show and save:
+
+font_colors_p
+ggsave(plot = font_colors_p, filename = '../figures/pdfboth_font_colors_green.pdf',
+       width = 9.5, height = 4.5)
+```
+
+## Font style
+
+Let's look at the text types:
+
+```{r}
+soju |> 
+  filter(!is.na(font_style)) |> 
+  adorn_percentages(font_style)
+```
+
+Reduced format:
+
+```{r}
+soju |> 
+  filter(!is.na(font_style)) |> 
+  adorn_percentages(font_style_red)
+```
+
+
+Check this over the years — decided to go with the un-simplified variable for now just to check that there's something going on. 
+
+```{r}
+soju |> 
+  filter(!is.na(font_style)) |> # to be replaced or kept after NAs are checked
+  count(year_binned, font_style) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = font_style)) +
+  geom_col(col = 'black') +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Print dominates throughout, but there's a clear downwards trend for the `Print and calligraphy` type, and a bit of a resurgence of `Calligraphy` and `Calligraphy and print` for the last two to three decades. I wonder whether this pattern is a similar "return to oldschool" that we've seen with the hanja. Let's see how these variables behave with respect to each other:
+
+```{r}
+soju |> 
+  filter(!is.na(hanja_red),
+         !is.na(font_style)) |> 
+  count(hanja_red, font_style) |> 
+  group_by(hanja_red) |> 
+  mutate(prop = n / sum(n))
+```
+
+So, there is a bit of association between those that have hanja and `Print and calligraphy`, which is proportionally much more frequent for this (15%) than for the no-Hanja cases (5%). The rest is not that different.
+
+Maybe it does make sense to keep `Print and calligraphy` and `Calligraphy and print` separate then, but I'm just not sure that this distinction could be captured with high inter-rater reliability?
+
+Let's look at font weight.
+
+```{r}
+soju |> 
+  filter(!is.na(font_weight)) |> 
+  adorn_percentages(font_weight)
+```
+
+Check this over time:
+
+```{r}
+soju |> 
+  filter(!is.na(font_weight)) |> # to be replaced or kept after NAs are checked
+  count(year_binned, font_weight) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = font_weight)) +
+  geom_col(col = 'black') +
+  scale_fill_brewer(palette = 'Spectral',
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Interesting. Quite a jump of `Bold` for the most modern ones, after otherwise it's been a slight trend towards more `Light` font. Could this be the same pattern of a resurgence of "bold" oldschoolness?
+
+I worry now that some of this stuff may be an artifact of the binning procedure. Perhaps it would make sense to look at this continuously, and we may want to take more fine-grained bins later then... but the issue with that would be that for some of the sparser years, results could then be increasingly deceiving (and things will look more jittery) because the proportion could be 100% for a given small dataset, but only due to a few cases, or even just a single one.
+
+Anyway, let's try the continuous year measure and the bold/light contrast:
+
+```{r}
+soju |> 
+  filter(!is.na(font_weight)) |> 
+  count(year, font_weight) |> 
+  group_by(year) |> 
+  mutate(prop = n / sum(n)) |> 
+  ungroup() |> 
+  ggplot(aes(x = year, y = prop, col = font_weight)) +
+  geom_line() +
+  scale_color_manual(values = c('grey', 'blue'),
+                     name = NULL) +
+  scale_x_continuous(limits = c(1960, 2020),
+                     breaks = seq(1960, 2020, 5)) +
+  xlab(NULL) +
+  ylab('Proportion')
+```
+
+A bit of a weird plot — we could only just show one line since they are each other's converses due to two mutually exclusive binary categories — but shows that the trend towards more bold in the last few years is definitely a thing. And there's a clear pattern with ads from 1995 to 2005 having more light font.
+
+Make a model for font weight, `p(y = has bold font)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               font_weight = factor(font_weight, levels = c('Light', 'Bold')))
+
+# Generalized additive logistic regression model (with time splines):
+
+weight_mdl <- brm(bf(font_weight ~ 1 +
+                       s(year) +
+                       (1|company)),
+                 data = soju,
+                 family = bernoulli,
+                 
+                 # MCMC settings:
+                   
+                 cores = 4, seed = 42,
+                 chains = 4, iter = 6000, warmup = 4000,
+                 control = list(adapt_delta = 0.99,
+                                max_treedepth = 12))
+
+# Save model:
+
+save(weight_mdl, file = '../models/weight_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/weight_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(weight_mdl, ndraws = 100)
+pp_check(weight_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+weight_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+weight_mdl_df <- conditional_effects(weight_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+weight_p <- weight_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+weight_p <- weight_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of boldface font')
+
+# Show and save:
+
+weight_p
+ggsave('../figures/pdf/font_weight.pdf', weight_p,
+       width = 5.8, height = 3.7)
+```
+
+## Model features
+
+### Presence of model
+
+Check whether there is a model or not:
+
+```{r}
+soju |> 
+  adorn_percentages(has_model)
+```
+
+65% have a model, 35% do not.
+
+See whether this changes across age, first using descriptive statistics:
+
+```{r}
+soju |> 
+  count(year_binned, has_model) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+Look at this time trend in a stacked bar plot:
+
+```{r}
+soju |> 
+  count(year_binned, has_model) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = has_model)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Makes it quite clear that there are more models over time, except slightly fewer in very recent years (post-2020).
+
+Model whether there is any model over time:
+
+Build a model of `p(y = has model)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               has_model = factor(has_model, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+has_model_mdl <- brm(bf(has_model ~ 1 +
+                          s(year) +
+                          (1|company)),
+                     data = soju,
+                     family = bernoulli,
+                     
+                     # MCMC settings:
+                   
+                     cores = 4, seed = 42,
+                     chains = 4, iter = 6000, warmup = 4000,
+                     control = list(adapt_delta = 0.99,
+                                    max_treedepth = 12))
+
+# Save model:
+
+save(has_model_mdl, file = '../models/has_model_mdl.RData')
+```
+
+**Bodo action point**: One divergent transition we need to get rid of!
+
+Load:
+
+```{r}
+load('../models/has_model_mdl.RData')
+```
+
+Check posterior predictive checks:
+
+```{r}
+pp_check(has_model_mdl, ndraws = 100)
+pp_check(has_model_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Looks good to me.
+
+```{r}
+has_model_mdl_df <- conditional_effects(has_model_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+model_p <- has_model_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+model_p <- model_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of female model')
+
+# Show and save:
+
+model_p
+ggsave('../figures/pdf/has_model_model.pdf', model_p,
+       width = 5.8, height = 3.7)
+```
+
+### Model gender: focus on females
+
+Check the `model_gender` variable:
+
+```{r}
+soju |> 
+  adorn_percentages(model_gender_red)
+```
+
+Female solo is by far the most common overall, but remember that we also have many more newer ads where these are more common.
+
+Look at this again, but using the subset of only those that have a solo model in it:
+
+```{r}
+soju |> 
+  filter(str_detect(model_gender_red, 'solo')) |> 
+  adorn_percentages(model_gender_red)
+```
+
+85% of those that have a solo character in it have a female character.
+
+Let's look at this over time:
+
+```{r}
+soju |> 
+  filter(str_detect(model_gender_red, 'solo')) |> 
+  count(year_binned, has_female) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+Compute average age per model gender category:
+
+```{r}
+soju |> 
+  group_by(model_gender_red) |> 
+  summarize(M = mean(year))
+```
+
+The temporal trend in stacked bar plot, for the `has_female` model variable:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |>  # only take those that have a model
+  count(year_binned, has_female) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = has_female)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Model of female over time:
+
+Build a model of `p(y = has female)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               has_female = factor(has_female, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+female_mdl <- brm(bf(has_female ~ 1 +
+                       s(year) +
+                       (1|company)),
+                  data = soju,
+                  family = bernoulli,
+                  
+                  # MCMC settings:
+                   
+                  cores = 4, seed = 42,
+                  chains = 4, iter = 6000, warmup = 4000,
+                  control = list(adapt_delta = 0.99,
+                                 max_treedepth = 12))
+
+# Save model:
+
+save(female_mdl, file = '../models/female_mdl.RData')
+```
+
+**Bodo action point**: One divergent transition we need to get rid of!
+
+Load:
+
+```{r}
+load('../models/female_mdl.RData')
+```
+
+Check posterior predictive checks:
+
+```{r}
+pp_check(female_mdl, ndraws = 100)
+pp_check(female_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Looks good to me.
+
+```{r}
+female_mdl_df <- conditional_effects(female_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+female_p <- female_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+female_p <- female_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of female model')
+
+# Show and save:
+
+female_p
+ggsave('../figures/pdf/female_model.pdf', female_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/female_model.png', female_p,
+       width = 5.8, height = 3.7)
+```
+
+### Model gender: focus on males
+
+Look at the time trend for the reduced variables `has_model`, `has_female`, `has_group`, `has_male`, and `has_mixed`:
+
+```{r}
+# Has male:
+
+soju |> 
+  count(year_binned, has_male) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = has_male)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Has group:
+
+soju |> 
+  count(year_binned, has_group) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = has_group)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Has mixed:
+
+soju |> 
+  count(year_binned, has_mixed) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = has_mixed)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Model of male over time:
+
+Build a model of `p(y = has male)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the hanja variable:
+
+soju <- mutate(soju,
+               has_male = factor(has_male, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+male_mdl <- brm(bf(has_male ~ 1 +
+                     s(year) +
+                     (1|company)),
+                data = soju,
+                family = bernoulli,
+                
+                # MCMC settings:
+                   
+                cores = 4, seed = 42,
+                chains = 4, iter = 6000, warmup = 4000,
+                control = list(adapt_delta = 0.99,
+                               max_treedepth = 12))
+
+# Save model:
+
+save(male_mdl, file = '../models/male_mdl.RData')
+```
+
+**Bodo action point**: 19(!!!) divergent transition we need to get rid of!
+
+Load:
+
+```{r}
+load('../models/male_mdl.RData')
+```
+
+Check posterior predictive checks:
+
+```{r}
+pp_check(male_mdl, ndraws = 100)
+pp_check(male_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Looks good to me.
+
+```{r}
+male_mdl_df <- conditional_effects(male_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+male_p <- male_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+male_p <- male_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of male model')
+
+# Show and save:
+
+male_p
+ggsave('../figures/pdf/male_model.pdf', male_p,
+       width = 5.8, height = 3.7)
+```
+
+Make a multi plot of all three (has model, has female, has male):
+
+```{r}
+# Change titles:
+
+model_p <- model_p + ggtitle('a) Presence of model')
+female_p <- female_p + ggtitle('b) Female model')
+male_p <- male_p + ggtitle('c) Male model')
+
+# Change y-axes:
+
+model_p <- model_p + ylab('Probability') +
+  theme(plot.title = element_text(face = 'bold'))
+female_p <- female_p + ylab(NULL) +
+  theme(axis.text.y = element_blank(),
+        plot.title = element_text(face = 'bold'))
+male_p <- male_p + ylab(NULL) +
+  theme(axis.text.y = element_blank(),
+        plot.title = element_text(face = 'bold'))
+
+# Merge:
+
+triple_p <- model_p + female_p + male_p
+
+# Show and save:
+
+triple_p
+ggsave(plot = triple_p, filename = '../figures/pdfmodel_triple.pdf',
+       width = 15, height = 4.5)
+```
+
+### Model clothing
+
+What is the color of the clothing? We'll look at this only in the color ads of course:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |>
+  filter(overall_color == 'Color') |> 
+  adorn_percentages(model_clothing_color) |> 
+  print(n = Inf)
+```
+
+Has this changed over time? White, blue, and blue and white versus rest only:
+
+```{r}
+these_keep <- c('White', 'Blue', 'Blue and white', 'Pink', 'Green')
+
+soju |> 
+  filter(overall_color == 'Color',
+         has_model == 'yes') |> 
+  mutate(clothing_color_red = if_else(model_clothing_color %in% these_keep,
+                                      model_clothing_color, 'other')) |> 
+  count(year_binned, clothing_color_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n)) |> 
+  print(n = Inf)
+```
+
+```{r}
+soju |> 
+  filter(overall_color == 'Color',
+         has_model == 'yes') |> 
+  mutate(clothing_color_red = if_else(model_clothing_color %in% these_keep,
+                                      model_clothing_color, 'other')) |> 
+  count(year_binned, clothing_color_red) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = p, fill = clothing_color_red)) +
+  geom_col(col = 'black') +
+  scale_fill_manual(values = c('blue', 'lightblue', 'green',
+                               'orange', 'pink',
+                               'white'),
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(legend.position = 'bottom')
+```
+
+Model the rise of white, and then the rise of blue:
+
+```{r}
+
+```
+
+
+
+
+Has this changed over time?
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  count(year_binned, model_clothing_color) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n)) |> 
+  print(n = Inf)
+```
+
+**Bodo action points**: Need to look at this more systematically and probably collapse categories.
+
+### Bare shoulders
+
+Look at this overall:
+
+```{r}
+soju |> 
+  filter(has_female == 'yes') |> 
+  adorn_percentages(female_bare_shoulders)
+```
+
+**Bodo action points**: What are the `NA`s here?
+
+Has this changed over time?
+
+```{r}
+soju |> 
+  filter(has_female == 'yes') |> 
+  count(year_binned, female_bare_shoulders) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+### Bare legs
+
+
+Look at this overall:
+
+```{r}
+soju |> 
+  filter(has_female == 'yes') |> 
+  adorn_percentages(female_bare_legs)
+```
+
+**Bodo action points**: What are the `NA`s here?
+
+Has this changed over time?
+
+```{r}
+soju |> 
+  filter(has_female == 'yes') |> 
+  count(year_binned, female_bare_legs) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+
+### Bare cleavage
+
+Look at this overall:
+
+```{r}
+soju |> 
+  filter(has_female == 'yes') |> 
+  adorn_percentages(female_bare_cleavage)
+```
+
+**Bodo action points**: What are the `NA`s here?
+
+Has this changed over time?
+
+```{r}
+soju |> 
+  filter(has_female == 'yes') |> 
+  count(year_binned, female_bare_cleavage) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+
+### Bottle in hand
+
+Look at this overall:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(model_bottle_holding_hand)
+```
+
+**Bodo action points**: What are the `NA`s here?
+
+Has this changed over time?
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  count(year_binned, model_bottle_holding_hand) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+Interesting shift. If the bottle was present in earlier years, it was held in the hands — these days there's more bottles overall as the other analyses show, but also they're more likely standalone.
+
+If it's held in the hand, which hand is it held in?
+
+```{r}
+soju |> 
+  filter(model_bottle_holding_hand == 'Yes') |> 
+  count(year_binned, if_holding_bottle_which_hand) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+Make a plot of this:
+
+```{r}
+soju |> 
+  filter(model_bottle_holding_hand == 'Yes') |> 
+  count(year_binned, if_holding_bottle_which_hand) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = if_holding_bottle_which_hand)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3', 'grey')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')
+```
+
+There definitely is a mild decline of holding it in both hands. The `Left` hand category seems a bit all over the place and I'm not sure why it would be that much more frequent in the 2000's.
+
+### Glass in hand
+
+Let's look at the `holding_glass` variable:
+
+```{r}
+soju |> 
+  filter(!is.na(holding_glass)) |> 
+  filter(!holding_glass %in% c('Yes (female)', 'Yes (male)')) |> 
+  count(year_binned, holding_glass) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+Looks like a definite rise of holding a glass. Let's plot that over time:
+
+```{r}
+soju |> 
+  filter(!is.na(holding_glass)) |> 
+  filter(!holding_glass %in% c('Yes (female)', 'Yes (male)')) |> 
+  count(year_binned, holding_glass) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = holding_glass)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')
+```
+
+Ok, maybe not as much. Just really absent in the 1960's, but we've got few ads for that, so the percentages may drift more drastically.
+
+### Hands on hips
+
+Are the hands on the hips?
+
+```{r}
+soju |> 
+  filter(!is.na(hand_on_hips)) |> 
+  count(year_binned, hand_on_hips) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+They never are before the 2000's!
+
+Plot this, with the option of plotting it for women only:
+
+```{r}
+soju |> 
+  # filter(has_female == 'yes') |> 
+  filter(!is.na(hand_on_hips)) |> 
+  count(year_binned, hand_on_hips) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = hand_on_hips)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')
+```
+
+### Hourglass body shape
+
+Let's look at `hourglass_body_shape`:
+
+```{r}
+soju |> 
+  filter(!is.na(hourglass_body_shape)) |> 
+  count(year_binned, hourglass_body_shape) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+They never are before the 2000's!
+
+Plot this:
+
+```{r}
+soju |> 
+  filter(!is.na(hourglass_body_shape)) |> 
+  count(year_binned, hourglass_body_shape) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = hourglass_body_shape)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')
+```
+
+### Body or facial appearance
+
+Let's look at `body_or_facial_appearance`:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(body_or_facial_appearance)
+```
+
+**Bodo action point**: Why is there still an `NA` value?
+
+Let's make a plot of this:
+
+```{r}
+soju |> 
+  filter(!is.na(body_or_facial_appearance)) |> 
+  count(year_binned, body_or_facial_appearance) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = body_or_facial_appearance)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')  
+```
+
+More "strong" facial appearances in the 70's or 80's ads.
+
+### Full body
+
+Let's check `full_body`:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(full_body)
+```
+
+Most don't have the full body.
+
+**Bodo action points**: But then why are "waist", "chest", "thighs" in there... shouldn't that be "No", there is no full body?
+
+So for now, let's just use the "No" and "Yes" levels.
+
+```{r}
+soju |> 
+  filter(!is.na(full_body)) |> 
+  filter(full_body %in% c('Yes', 'No')) |> 
+  count(year_binned, full_body) |> 
+  group_by(year_binned) |> 
+  mutate(p = n / sum(n),
+         perc = str_c(round(p, 3) * 100, '%'))
+```
+
+Look at this in a plot:
+
+```{r}
+soju |> 
+  filter(!is.na(full_body)) |> 
+  filter(full_body %in% c('Yes', 'No')) |> 
+  count(year_binned, full_body) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = full_body)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')  
+```
+
+Not really a temporal trend over than the 1960's being very different.
+
+### Camera shot
+
+Let's look at the camera angles:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(camera_shot)
+```
+
+**Bodo action points**: Why are the "No" instances? If there's a model, there should be a camera shot!
+
+Look at this over time:
+
+```{r}
+soju |> 
+  filter(!is.na(camera_shot)) |> 
+  filter(camera_shot != 'No') |> 
+  count(year_binned, camera_shot) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = camera_shot)) +
+  geom_col(color = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_brewer(palette = 'Spectral') +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top')  
+```
+
+### Eye contact
+
+Does the model make eye contact?
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(eye_contact)
+```
+
+**Bodo action points**: Why are there `NA`s?
+
+```{r}
+soju |> 
+  filter(!is.na(eye_contact)) |> 
+  filter(!eye_contact %in% c('Female = yes, male = no',
+                            'Male = yes')) |> 
+  count(year_binned, eye_contact) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = eye_contact)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top') 
+```
+
+Definitely more likely to make eye contact in later years, it looks like!
+
+### Smile
+
+Does the model smile?
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(smile)
+```
+
+**Bodo action points**: Why are there `NA`s?
+
+```{r}
+soju |> 
+  filter(!is.na(smile)) |> 
+  count(year_binned, smile) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = smile)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top') 
+```
+
+### Head tilt
+
+Does the model do a head tilt?
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(head_tilt)
+```
+
+**Bodo action points**: Why are there `NA`s?
+
+```{r}
+soju |> 
+  filter(!is.na(head_tilt)) |> 
+  filter(head_tilt %in% c('No', 'Side')) |> 
+  count(year_binned, head_tilt) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = head_tilt)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top') 
+```
+
+### Wink
+
+Let's look at whether the model winked:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(wink)
+```
+
+**Bodo action points**: Why are there `NA`s?
+
+```{r}
+soju |> 
+  filter(!is.na(wink)) |> 
+  count(year_binned, wink) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = wink)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top') 
+```
+
+Only occurs in later years. While that could be fitting a more informal style, we have to note that we also have more models in later years and this percentage is uber-small, so it could also just be that the percentage is kinda constant, we just happen to have not enough data for the earlier years.
+
+### Puckered lips
+
+Let's look at the `puckered_lips` variable:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(puckered_lips)
+```
+
+**Bodo action points**: Why are there `NA`s?
+
+```{r}
+soju |> 
+  filter(!is.na(puckered_lips)) |> 
+  count(year_binned, puckered_lips) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = puckered_lips)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top') 
+```
+
+Similar considerations as above.
+
+### Hand on face
+
+Let's look at the `hand_on_face` variable:
+
+```{r}
+soju |> 
+  filter(has_model == 'yes') |> 
+  adorn_percentages(hand_on_face)
+```
+
+**Bodo action points**: Why are there `NA`s?
+
+```{r}
+soju |> 
+  filter(!is.na(hand_on_face)) |> 
+  count(year_binned, hand_on_face) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = hand_on_face)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_fill_manual(values = c('purple', 'goldenrod3')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top') 
+```
+
+Similar considerations as above.
+
+# Other visual features
+
+### Background
+
+Let's look at `background_color`:
+
+```{r}
+background_color_counts <- soju |> 
+  filter(overall_color == 'Color') |> 
+  count(background_color, sort = TRUE) |> 
+  print(n = Inf)
+
+# Show:
+
+background_color_counts
+```
+
+Let's look at the six most common again, extracting a vector of the first six rows from the table of counts we've just created:
+
+```{r}
+keep_these <- background_color_counts |> 
+  slice_head(n = 6) |> 
+  pull(background_color)
+
+# Show:
+
+keep_these
+```
+
+Ok, now, a plot over time:
+
+```{r}
+soju |> 
+  filter(overall_color == 'Color',
+         background_color %in% keep_these) |> 
+  mutate(background_color = factor(background_color, levels = keep_these)) |> 
+  count(year_binned, background_color) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = background_color)) +
+  geom_col(col = 'black') +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_fill_manual(values = c('white', 'lightblue',
+                               'blue', 'darkgreen', 'lightgreen',
+                               'beige'),
+                    name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Proportion') +
+  xlab(NULL) +
+  theme(legend.position = 'none')
+
+ggsave('../figures/png/background_color.png', width = 5.2, height = 3.8)
+ggsave('../figures/pdf/background_color.pdf', width = 5.2, height = 3.8)
+```
+
+Certainly they swapped backgrounds from white to blue or blue and white in the last two decades.
+
+Check `background_type`:
+
+```{r}
+soju |> 
+  count(background_type, sort = TRUE)
+```
+
+205 rows... that's far too many categories to look at. What should I do with this?
+
+Build a model of `p(y = has blue and white)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               blue_or_white_background = if_else(background_color == 'Blue and white',
+                                                  'yes', 'no'),
+               blue_or_white_background = factor(blue_or_white_background,
+                                                 levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+blue_white_background_mdl <- brm(bf(blue_or_white_background ~ 1 +
+                                 s(year) +
+                                 (1|company)),
+                            data = soju,
+                            family = bernoulli,
+                 
+                            # MCMC settings:
+                   
+                            cores = 4, seed = 42,
+                            chains = 4, iter = 6000, warmup = 4000,
+                            control = list(adapt_delta = 0.99,
+                                           max_treedepth = 12))
+
+# Save model:
+
+save(blue_white_background_mdl, file = '../models/blue_white_background_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/blue_white_background_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(blue_white_background_mdl, ndraws = 100)
+pp_check(blue_white_background_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+blue_white_background_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+blue_white_background_mdl_df <- conditional_effects(blue_white_background_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+blue_white_background_p <- blue_white_background_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+blue_white_background_p <- blue_white_background_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of blue and white background')
+
+# Show and save:
+
+blue_white_background_p
+ggsave('../figures/pdf/blue_and_white_background.pdf', blue_white_background_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/blue_and_white_background.png', blue_white_background_p,
+       width = 5.8, height = 3.7)
+```
+
+
+
+
+## Plants
+
+Assess the presence of plants, first in the background:
+
+```{r}
+soju |> 
+  count(plants_trees_background)
+```
+
+That's easy enough to work with! Let's plot that:
+
+```{r}
+soju |> 
+  count(year_binned, plants_trees_background) |> 
+  group_by(year_binned) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = year_binned, y = prop, fill = plants_trees_background)) +
+  geom_col(col = 'black') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_fill_manual(values = c('purple', 'lightgreen', 'darkgreen')) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'none')
+
+ggsave('../figures/png/plants_trees_background.png',
+       width = 4.5, height = 3.8)
+```
+
+Skipping ahead now just to get a few more of the really interesting stuff out of the way. Will have to look at `restaurant_background`, `food_background` later.
+
+Build a model of `p(y = has trees)`, which will be a logistic regression model:
+
+```{r eval = FALSE}
+# Factor-code the variable with desired level order:
+
+soju <- mutate(soju,
+               plant_background = factor(plant_background, levels = c('no', 'yes')))
+
+# Generalized additive logistic regression model (with time splines):
+
+plant_background_mdl <- brm(bf(plant_background ~ 1 +
+                                 s(year) +
+                                 (1|company)),
+                            data = soju,
+                            family = bernoulli,
+                 
+                            # MCMC settings:
+                   
+                            cores = 4, seed = 42,
+                            chains = 4, iter = 6000, warmup = 4000,
+                            control = list(adapt_delta = 0.99,
+                                           max_treedepth = 12))
+
+# Save model:
+
+save(plant_background_mdl, file = '../models/plant_background_mdl.RData')
+```
+
+Load:
+
+```{r}
+load('../models/plant_background_mdl.RData')
+```
+
+Show posterior predictive simulations:
+
+```{r}
+pp_check(plant_background_mdl, ndraws = 100)
+pp_check(plant_background_mdl, ndraws = 100, type = 'ecdf_overlay')
+```
+
+Check the model:
+
+```{r}
+plant_background_mdl
+```
+
+Extract conditional effects for plotting:
+
+```{r}
+plant_background_mdl_df <- conditional_effects(plant_background_mdl)$year
+```
+
+Make a plot of the curve:
+
+```{r}
+# Plot core:
+
+plant_background_p <- plant_background_mdl_df |> 
+  ggplot(aes(x = year, y = estimate__,
+             ymin = lower__, ymax = upper__)) +
+  geom_ribbon(fill = 'grey', alpha = 0.7) +
+  geom_line(col = 'purple', size = 1.25)
+
+# Axes and labels:
+
+plant_background_p <- plant_background_p +
+  scale_x_continuous(breaks = seq(1960, 2020, 10)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0, 0)) +
+  xlab('Year') +
+  ylab('Probability of plants in background')
+
+# Show and save:
+
+plant_background_p
+ggsave('../figures/pdf/plant_background.pdf', plant_background_p,
+       width = 5.8, height = 3.7)
+ggsave('../figures/png/plant_background.png', plant_background_p,
+       width = 5.8, height = 3.7)
+```
+
+
+
+
+# Multiple correspondence analysis (MCA)
+
+**Bodo action point**: Need to think about `NA`s.
+
+Create soju table that encodes everything into binary variables.
+
+```{r}
+soju_binary <- soju
+
+soju_binary <- mutate(soju_binary,
+                      # Logo location variables:
+                      
+                      logo_top = if_else(logo_vertical == 'top', 'yes', 'no'),
+                      logo_center_v = if_else(logo_vertical == 'center', 'yes', 'no'),
+                      logo_bottom = if_else(logo_vertical == 'bottom', 'yes', 'no'),
+                      logo_left = if_else(logo_horizontal == 'left', 'yes', 'no'),
+                      logo_center_h = if_else(logo_horizontal == 'center', 'yes', 'no'),
+                      logo_right = if_else(logo_horizontal == 'right', 'yes', 'no'),
+                      
+                      # Logo modality and type:
+                      
+                      logo_separate = if_else(multimodal_logo_type == 'Separate', 'yes', 'no'),
+                      logo_merged = if_else(multimodal_logo_type == 'Merged', 'yes', 'no'),
+                      logo_word = if_else(logo_modality == 'Word', 'yes', 'no'),
+                      logo_word_image = if_else(logo_modality == 'Word and image', 'yes', 'no'),
+                      logo_image = if_else(logo_modality == 'Image', 'yes', 'no'),
+                      
+                      # Has bold face (for parallelism):
+                      
+                      has_boldface = if_else(font_weight == 'Bold', 'yes', 'no')
+                      
+                      )
+```
+
+Let's extract everything and make all NAs into 0's:
+
+```{r}
+# Define vector to extract:
+
+pred_vector <- c('logo_top', 'logo_center_v', 'logo_bottom',
+                 'logo_left', 'logo_center_h', 'logo_right',
+                 'logo_separate', 'logo_merged', 'logo_word_image',
+                 'logo_image',
+                 
+                 # Hanja, roman and loan word variables:
+                 
+                 'hanja_red', 'roman_red', 'loan_word_red',
+                 
+                 # Model variables:
+                 
+                 'has_model', 'has_female', 'has_male', 'has_mixed', 'has_group',
+                 
+                 # Slogan ending variables:
+                 
+                 'verb_ending', 'noun_ending', 'sound_object', 'has_panmal',
+                 
+                 # Font color variables:
+                 
+                 'any_green', 'any_blue',
+                 
+                 # Other variables:
+                 
+                 'has_calligraphy', 'has_boldface',
+                 
+                 # Background variables:
+                 
+                 'plant_background',
+                 
+                 # Bottle variables:
+                 
+                 'has_bottle',
+                 'has_green_bottle', 'has_clear_bottle', 'has_black_or_brown_bottle'
+                 )
+
+# Extract columns:
+
+soju_M <- soju_binary[, pred_vector]
+
+# Make NAs into zeros:
+
+soju_M <- mutate_all(soju_M, .funs = function(x) if_else(is.na(x), 'no', x))
+```
+
+Run the MCA:
+
+```{r}
+soju_MCA <- MCA(as.matrix(soju_M), graph = FALSE)
+```
+
+Make a scree plot to see how many dimensions are useful:
+
+```{r}
+soju_scree <- fviz_screeplot(soju_MCA, addlabels = TRUE)
+
+# Show:
+
+soju_scree
+```
+
+Correlation between variables and dimensions:
+
+```{r}
+MCA_vars <- fviz_mca_var(soju_MCA,
+                         choice = 'mca.cor', repel = TRUE, ggtheme = theme_classic())
+
+# Show:
+
+MCA_vars
+```
+
+Check contributions for dimensions:
+
+```{r}
+dim1_contribution <- fviz_contrib(soju_MCA, choice = 'var', axes = 1, top = 15)
+dim2_contribution <- fviz_contrib(soju_MCA, choice = 'var', axes = 2, top = 15)
+dim3_contribution <- fviz_contrib(soju_MCA, choice = 'var', axes = 3, top = 15)
+
+# Plot & save:
+
+dim1_contribution
+dim2_contribution
+dim3_contribution
+```
+
+Get the coordinates to plot them for the first two dimensions only for now:
+
+```{r}
+# First two dimensions:
+
+# get_mca_ind
+
+soju_coordinates <- soju_MCA$ind$coord[, 1:3] |> 
+  as_tibble()
+
+# Append alcohol, year, and company:
+
+soju_coordinates <- bind_cols(select(soju,
+                                     alcohol_content, year, company),
+                              soju_coordinates)
+```
+
+Make the plot of two dimensions:
+
+```{r}
+soju_coordinates |> 
+  ggplot(aes(x = `Dim 1`, y = `Dim 2`)) +
+  geom_jitter(width = 0.03, height = 0.03, alpha = 0.5,
+              mapping = aes(col = alcohol_content))
+```
+
+Third versus second, since first is always logo:
+
+```{r}
+soju_coordinates |> 
+  ggplot(aes(x = `Dim 2`, y = `Dim 3`)) +
+  geom_jitter(width = 0.03, height = 0.03, alpha = 0.5,
+              mapping = aes(col = alcohol_content))
+```
+
+First versus third, since first is always logo:
+
+```{r}
+soju_coordinates |> 
+  ggplot(aes(x = `Dim 1`, y = `Dim 3`)) +
+  geom_jitter(width = 0.03, height = 0.03, alpha = 0.5,
+              mapping = aes(col = alcohol_content))
+```
+
+
+# Random forest
+
+Create a variable that has all predictors:
+
+```{r}
+pred_pluses <- str_c(pred_vector, collapse = ' + ')
+
+# Check:
+
+pred_pluses
+```
+
+Build a random forest predicting alcohol content:
+
+```{r}
+# alcohol_forest <- ranger(formula = str_c('alcohol_content ~ ', pred_pluses),
+#                    importance = 'permutation', num.trees = 1500,
+#                    probability = TRUE,
+#                    seed = 42,
+#                    data = soju_binary)
+```
+
+**Bodo action point**: Need to think about `NA`s.
+
+
+
